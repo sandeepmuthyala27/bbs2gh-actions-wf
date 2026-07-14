@@ -62,6 +62,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate runner/timeout combination
+        shell: bash
+        env:
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          MIGRATE_TIMEOUT: ${{ inputs.migrate_timeout_minutes }}
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_LABEL" == "ubuntu-latest" && "${MIGRATE_TIMEOUT}" -gt 360 ]]; then
+            echo "::error::GitHub-hosted runners (ubuntu-latest) are capped at 360 minutes, but migrate_timeout_minutes=${MIGRATE_TIMEOUT}. Choose 360, or set runner_label=self-hosted for longer runs."
+            exit 1
+          fi
+          echo "Runner=${RUNNER_LABEL}, migrate timeout=${MIGRATE_TIMEOUT} min"
+
       - name: Resolve BBS_BASE_URL (input -> repo var)
         shell: bash
         env:
@@ -94,8 +107,8 @@ jobs:
         env:
           BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
           BBS_PAT: ${{ secrets.BBS_PAT }}
-          BBS_AUTH_TYPE: ${{ secrets.BBS_AUTH_TYPE }}
-          BBS_USERNAME: ${{ secrets.BBS_USERNAME }}
+          BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
+          BBS_USERNAME: ${{ vars.BBS_USERNAME }}
           BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
         run: |
           set -euo pipefail
@@ -283,9 +296,9 @@ jobs:
           # CRITICAL: don’t use env-token auth during the script; use the stored token in GH_CONFIG_DIR
           GH_TOKEN: ''
           BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
-          BBS_USERNAME: ${{ secrets.BBS_USERNAME }}
+          BBS_USERNAME: ${{ vars.BBS_USERNAME }}
           BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
-          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_USER: ${{ vars.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           TARGET_API_URL: ${{ env.TARGET_API_URL }}
           AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
@@ -308,7 +321,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: migration-logs-${{ github.run_id }}
-          path: ${{ runner.temp }}/bbs2gh-run/migration-*.txt
+          path: |
+            ${{ runner.temp }}/bbs2gh-run/migration-*.txt
+            ${{ runner.temp }}/bbs2gh-run/*.log
           retention-days: 90
           if-no-files-found: warn
 
@@ -479,9 +494,11 @@ jobs:
           GH_TOKEN: ''
           BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
           BBS_PAT: ${{ secrets.BBS_PAT }}
-          BBS_AUTH_TYPE: ${{ secrets.BBS_AUTH_TYPE }}
-          BBS_USERNAME: ${{ secrets.BBS_USERNAME }}
+          BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
+          BBS_USERNAME: ${{ vars.BBS_USERNAME }}
           BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
+          COMMIT_CHECK: ${{ vars.COMMIT_CHECK }}
+          FAIL_ON_VALIDATION_FAILURES: ${{ vars.FAIL_ON_VALIDATION_FAILURES }}
         run: |
           set -euo pipefail
           export GH_CONFIG_DIR="$RUNNER_TEMP/gh-dr"
