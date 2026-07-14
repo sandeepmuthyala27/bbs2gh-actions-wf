@@ -89,6 +89,17 @@ else
   OUTPUT_CSV_PATH="${OUTPUT_PATH}"
 fi
 
+if ! command -v gh >/dev/null 2>&1; then
+  echo -e "\033[31m[ERROR] GitHub CLI (gh) is not installed. See https://cli.github.com/\033[0m"
+  exit 1
+fi
+logv "gh version: $(gh --version | head -n 1)"
+if ! gh extension list 2>/dev/null | awk '{print $1}' | grep -qx 'gh-bbs2gh'; then
+  echo -e "\033[31m[ERROR] Required gh extension 'gh-bbs2gh' is not installed. Install with: gh extension install github/gh-bbs2gh\033[0m"
+  exit 1
+fi
+logv "gh bbs2gh version: $(gh bbs2gh --version 2>/dev/null | head -n 1)"
+
 # gh auth
 if ! gh auth status >/dev/null 2>&1; then
   echo -e "\033[31m[ERROR] GitHub CLI not authenticated. Run: gh auth login (or set GH_TOKEN/GH_PAT).\033[0m"
