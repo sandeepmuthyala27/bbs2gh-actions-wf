@@ -29,20 +29,43 @@ while getopts ":c:b:" opt; do
   esac
 done
 
-# GH auth
-if ! gh auth status >/dev/null 2>&1; then
-  echo "[ERROR] GitHub CLI not authenticated. Run: gh auth login (or set GH_TOKEN/GH_PAT)." >&2
-  exit 1
-fi
+COMMIT_CHECK="${COMMIT_CHECK:-true}"
+FAIL_ON_VALIDATION_FAILURES="${FAIL_ON_VALIDATION_FAILURES:-false}"
 
-# Base URL
+LOG_FILE="validation-log-$(date +'%Y%m%d-%H%M%S').txt"
+
+C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'; C_BLUE='\033[0;34m'; C_RED='\033[0;31m'; C_NC='\033[0m'
+log_info()    { echo -e "${C_BLUE}[INFO]${C_NC} $1"      | tee -a "$LOG_FILE"; }
+log_success() { echo -e "${C_GREEN}[OK]${C_NC} $1"       | tee -a "$LOG_FILE"; }
+log_warning() { echo -e "${C_YELLOW}[WARNING]${C_NC} $1" | tee -a "$LOG_FILE"; }
+log_error()   { echo -e "${C_RED}[ERROR]${C_NC} $1"      | tee -a "$LOG_FILE" >&2; }
+
+ensure_tooling() {
+  if ! command -v gh >/dev/null 2>&1; then
+    log_error "GitHub CLI (gh) is not installed. See https://cli.github.com/"
+    exit 1
+  fi
+  log_info "gh version: $(gh --version | head -n 1)"
+}
+
+ensure_auth() {
+  if [[ -n "${GH_PAT:-}" && -z "${GH_TOKEN:-}" ]]; then
+    export GH_TOKEN="$GH_PAT"
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    log_error "GitHub CLI not authenticated. Run: gh auth login (or set GH_TOKEN/GH_PAT)."
+    exit 1
+  fi
+}
+
+ensure_tooling
+ensure_auth
+
 if [[ -z "$BBS_BASE_URL" ]]; then
-  echo "[ERROR] BBS_BASE_URL is required (pass -b or export BBS_BASE_URL)." >&2
+  log_error "BBS_BASE_URL is required (pass -b or export BBS_BASE_URL)."
   exit 1
 fi
 BASE_URL="${BBS_BASE_URL%/}"
-
-LOG_FILE="validation-log-$(date +'%Y%m%d-%H%M%S').txt"
 
 # ---- Bitbucket auth header ----------------------------------------------------
 auth_header() {
@@ -202,16 +225,51 @@ validate_repo() {
     [[ -n "$missingInGH" ]]  && echo "[$(date)] Branches missing in GitHub: $(echo "$missingInGH" | tr '\n' ', ')"
     [[ -n "$missingInBBS" ]] && echo "[$(date)] Branches missing in Bitbucket: $(echo "$missingInBBS" | tr '\n' ', ')"
 
-    # D — SHA comparison using data already in maps from Step B (zero extra API calls)
+    # D — SHA comparison
     local shasMatchAll="false"
-    if [[ "$ghExists" == "yes" && "${#bbsSHAmap[@]}" -gt 0 && "${#ghSHAmap[@]}" -gt 0 ]]; then
-      local common=()
-      mapfile -t common < <(comm -12 \
-        <(printf "%s\n" "${!bbsSHAmap[@]}" | sort) \
-        <(printf "%s\n" "${!ghSHAmap[@]}"  | sort))
-      if (( ${#common[@]} > 0 )); then
+    if [[ "${COMMIT_CHECK}" != "true" ]]; then
+      shasMatchAll="true"
+      echo "[$(date)] COMMIT_CHECK=false - skipping per-branch SHA comparison"
+    elif [[ "$ghExists" == "yes" && "${#bbsSHAmap[@]}" -gt 0 && "${#ghSHAmap[@]}" -gt 0 ]]; then
+      local ghDefault bbsDefault validation_branch=""
+      ghDefault="$(gh api "/repos/${ghOrg}/${ghRepo}" --jq '.default_branch' 2>/dev/null || true)"
+      bbsDefault="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${bbsProjectKey}/repos/${bbsRepoSlug}/branches/default" 2>/dev/null | jq -r '.displayId // empty' 2>/dev/null || true)"
+      if [[ -n "$ghDefault" && ( -n "${ghSHAmap[$ghDefault]:-}" || -n "${bbsSHAmap[$ghDefault]:-}" ) ]]; then
+        validation_branch="$ghDefault"
+      elif [[ -n "$bbsDefault" && ( -n "${ghSHAmap[$bbsDefault]:-}" || -n "${bbsSHAmap[$bbsDefault]:-}" ) ]]; then
+        validation_branch="$bbsDefault"
+      fi
+
+      local -a branches_to_check=()
+      if (( bbsBranchCount > 10 || ghBranchCount > 10 )); then
+        [[ -n "$validation_branch" ]] && branches_to_check+=("$validation_branch")
+        local name
+        for name in "${!ghSHAmap[@]}"; do
+          [[ "$name" == "$validation_branch" ]] && continue
+          branches_to_check+=("$name")
+          (( ${#branches_to_check[@]} >= 10 )) && break
+        done
+        echo "[$(date)] Repo has >10 branches. SHA check limited to first ${#branches_to_check[@]} branches (default branch first)."
+      elif [[ -n "$validation_branch" ]]; then
+        branches_to_check+=("$validation_branch")
+        echo "[$(date)] Repo has <=10 branches. SHA check limited to default branch: '${validation_branch}'."
+      else
+        echo "[$(date)] Could not determine a default branch for SHA check."
+      fi
+
+      if (( ${#branches_to_check[@]} > 0 )); then
         shasMatchAll="true"
-        for br in "${common[@]}"; do
+        local br
+        for br in "${branches_to_check[@]}"; do
+          [[ -z "$br" ]] && continue
+          if [[ -z "${ghSHAmap[$br]:-}" ]]; then
+            echo "[$(date)] Branch '$br': missing in GitHub branches list $(status_marker false)"
+            shasMatchAll="false"; continue
+          fi
+          if [[ -z "${bbsSHAmap[$br]:-}" ]]; then
+            echo "[$(date)] Branch '$br': missing in Bitbucket branches list $(status_marker false)"
+            shasMatchAll="false"; continue
+          fi
           local bbsSha="${bbsSHAmap[$br]:-}" ghSha="${ghSHAmap[$br]:-}"
           local shaOk="false"
           [[ -n "$ghSha" && "$ghSha" == "$bbsSha" ]] && shaOk="true"
@@ -287,3 +345,25 @@ md="${summary_csv%.csv}.md"
 echo "=======================Summary==========================="
 cat ${md}
 echo "======================Completed==========================="
+
+total_validated=$(awk -F',' 'NR>1{c++} END{print c+0}' "$summary_csv")
+passed=$(awk -F',' 'NR>1 && $7=="true" && $8=="true"{c++} END{print c+0}' "$summary_csv")
+failed=$(( total_validated - passed ))
+
+if (( total_validated == 0 )); then
+  echo "::notice::No repositories were validated."
+elif (( failed == 0 )); then
+  echo "::notice::All ${total_validated} repositories validated successfully (branches and SHAs match)"
+elif (( passed == 0 )); then
+  echo "::error::All ${total_validated} repositories have validation discrepancies"
+  awk -F',' 'NR>1 && !($7=="true" && $8=="true"){printf "::error::Validation discrepancy: %s/%s (%s)\n",$1,$2,$9}' "$summary_csv"
+else
+  echo "::warning::Validation completed with discrepancies: ${passed} matched, ${failed} with issues (of ${total_validated})"
+  awk -F',' 'NR>1 && !($7=="true" && $8=="true"){printf "::warning::Validation discrepancy: %s/%s (%s)\n",$1,$2,$9}' "$summary_csv"
+fi
+
+if [[ "$FAIL_ON_VALIDATION_FAILURES" == "true" && "$failed" -gt 0 ]]; then
+  echo "::error::FAIL_ON_VALIDATION_FAILURES=true and ${failed} repository(ies) failed validation."
+  exit 1
+fi
+exit 0
