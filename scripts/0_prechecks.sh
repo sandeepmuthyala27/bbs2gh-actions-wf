@@ -32,6 +32,44 @@ log_success() { echo -e "${C_GREEN}[OK]${C_NC} $1"       | tee -a "$LOG_FILE"; }
 log_warning() { echo -e "${C_YELLOW}[WARNING]${C_NC} $1" | tee -a "$LOG_FILE"; }
 log_error()   { echo -e "${C_RED}[ERROR]${C_NC} $1"      | tee -a "$LOG_FILE" >&2; }
 
+detect_bbs_install() {
+  local p launcher userPath bbsHome
+  if [[ -n "${BITBUCKET_HOME:-}" && -d "${BITBUCKET_HOME}" ]]; then
+    export BITBUCKET_HOME
+    log_success "Bitbucket Server home found via BITBUCKET_HOME: ${BITBUCKET_HOME}"
+    return 0
+  fi
+  for p in /var/atlassian/application-data/bitbucket /opt/atlassian/bitbucket; do
+    if [[ -d "$p" ]]; then
+      export BITBUCKET_HOME="$p"
+      log_success "Bitbucket Server found at default location: ${p}"
+      return 0
+    fi
+  done
+  launcher="$(command -v start-bitbucket.sh 2>/dev/null || command -v bitbucket 2>/dev/null || true)"
+  if [[ -n "$launcher" ]]; then
+    bbsHome="$(cd "$(dirname "$launcher")/.." 2>/dev/null && pwd || dirname "$launcher")"
+    export BITBUCKET_HOME="$bbsHome"
+    log_success "Bitbucket Server launcher found on PATH: ${launcher} (home: ${bbsHome})"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    read -r -p "Bitbucket Server install not found (checked BITBUCKET_HOME, /var/atlassian/application-data/bitbucket, /opt/atlassian/bitbucket, PATH). Enter its path (blank to skip): " userPath || true
+    if [[ -n "${userPath:-}" && -d "${userPath}" ]]; then
+      export BITBUCKET_HOME="${userPath}"
+      log_success "Using Bitbucket Server path: ${userPath}"
+    elif [[ -n "${userPath:-}" ]]; then
+      log_warning "Path does not exist: ${userPath}. Continuing without a local Bitbucket Server path."
+    else
+      log_warning "No path provided. Continuing without a local Bitbucket Server path."
+    fi
+  else
+    log_warning "Bitbucket Server install not found locally. Continuing (remote/SSH migration does not require a local install)."
+  fi
+  return 0
+}
+detect_bbs_install
+
 auth_header() {
   if [[ -n "${BBS_PAT:-}" ]]; then
     echo "Authorization: Bearer ${BBS_PAT}"
