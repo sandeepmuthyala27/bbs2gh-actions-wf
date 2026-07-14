@@ -24,6 +24,14 @@ if [[ -z "${BBS_BASE_URL:-}" ]]; then
 fi
 BASE_URL="${BBS_BASE_URL%/}"
 
+LOG_FILE="bbs-prechecks-$(date +'%Y%m%d-%H%M%S').log"
+
+C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'; C_BLUE='\033[0;34m'; C_RED='\033[0;31m'; C_NC='\033[0m'
+log_info()    { echo -e "${C_BLUE}[INFO]${C_NC} $1"      | tee -a "$LOG_FILE"; }
+log_success() { echo -e "${C_GREEN}[OK]${C_NC} $1"       | tee -a "$LOG_FILE"; }
+log_warning() { echo -e "${C_YELLOW}[WARNING]${C_NC} $1" | tee -a "$LOG_FILE"; }
+log_error()   { echo -e "${C_RED}[ERROR]${C_NC} $1"      | tee -a "$LOG_FILE" >&2; }
+
 auth_header() {
   if [[ -n "${BBS_PAT:-}" ]]; then
     echo "Authorization: Bearer ${BBS_PAT}"
@@ -41,10 +49,16 @@ curl_json() {
 }
 
 # Preflight auth test
-curl -f -sS -H "$(auth_header)" "${BASE_URL}/rest/api/1.0/projects?limit=1" >/dev/null || {
-  echo "[ERROR] Bitbucket auth failed. Verify BBS_BASE_URL and credentials." >&2
+preflight_status="$(curl -s -o /dev/null -w '%{http_code}' -H "$(auth_header)" "${BASE_URL}/rest/api/1.0/projects?limit=1")"
+if [[ "$preflight_status" -lt 200 || "$preflight_status" -ge 300 ]]; then
+  case "$preflight_status" in
+    401|403) log_error "Bitbucket auth failed (HTTP $preflight_status). Verify BBS_PAT / credentials and permissions." ;;
+    404)     log_error "Bitbucket endpoint not found (HTTP 404). Verify BBS_BASE_URL: ${BASE_URL}" ;;
+    000)     log_error "Network/DNS/TLS issue reaching Bitbucket (HTTP 000). Verify connectivity to ${BASE_URL}." ;;
+    *)       log_error "Bitbucket preflight failed (HTTP $preflight_status) for ${BASE_URL}." ;;
+  esac
   exit 1
-}
+fi
 
 timestamp="$(date +'%Y%m%d-%H%M%S')"
 OUTPUT_CSV="${OUTPUT_PATH:-bbs_pr_validation_output-${timestamp}.csv}"
@@ -124,8 +138,20 @@ else
 fi
 
 total_repos="$(($(wc -l < "$rows_tmp")))"
+ready_repos=0
+[[ -f "$ready_tmp" ]] && ready_repos="$(wc -l < "$ready_tmp" | tr -d ' ')"
+repos_with_open_prs=$(( total_repos - ready_repos ))
 
 echo ""
 echo "[SUMMARY] Total repos: $total_repos"
 echo "Open PRs total: $total_open_prs"
 echo "======================Completed============================="
+
+if (( total_repos == 0 )); then
+  echo "::notice::No repositories found to check."
+elif (( repos_with_open_prs == 0 )); then
+  echo "::notice::All ${total_repos} repositories are ready to migrate (no open PRs)"
+else
+  echo "::warning::${repos_with_open_prs} of ${total_repos} repositories have open PRs"
+  awk -F',' 'NR>1 && $7=="false"{printf "::warning::Open PRs: %s/%s (%s open)\n",$1,$3,$5}' "$OUTPUT_CSV"
+fi
