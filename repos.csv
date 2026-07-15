@@ -1,3 +1,3 @@
 project-key,project-name,repo,github_org,github_repo,gh_repo_visibility
-BBSMIG,bbs-migration-demo,calotracker,bbs2gh-migration,calotracker44,private
-BBSMIG,bbs-migration-demo,solid-api,bbs2gh-Migration,solid-api_bbs,private
+BBSMIG,bbs-migration-demo,calotracker,bbs2gh-migration,calotracker_bbs-13ab,private
+BBSMIG,bbs-migration-demo,solid-api,bbs2gh-migration,solid-api_bbs-13ab,private
