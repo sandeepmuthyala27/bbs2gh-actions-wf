@@ -94,7 +94,7 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 1
 fi
 logv "gh version: $(gh --version | head -n 1)"
-if ! gh extension list 2>/dev/null | awk '{print $1}' | grep -qx 'gh-bbs2gh'; then
+if ! gh bbs2gh --version >/dev/null 2>&1; then
   echo -e "\033[31m[ERROR] Required gh extension 'gh-bbs2gh' is not installed. Install with: gh extension install github/gh-bbs2gh\033[0m"
   exit 1
 fi
