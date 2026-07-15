@@ -67,6 +67,18 @@ $OUTPUT_CSV_PATH = if ([string]::IsNullOrEmpty($OUTPUT_PATH)) {
   $OUTPUT_PATH
 }
 
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+  Write-Host "`e[31m[ERROR] GitHub CLI (gh) is not installed. See https://cli.github.com/`e[0m"
+  exit 1
+}
+LogV "gh version: $((& gh --version | Select-Object -First 1))"
+& gh bbs2gh --version *> $null
+if ($LASTEXITCODE -ne 0) {
+  Write-Host "`e[31m[ERROR] Required gh extension 'gh-bbs2gh' is not installed. Install with: gh extension install github/gh-bbs2gh`e[0m"
+  exit 1
+}
+LogV "gh bbs2gh version: $((& gh bbs2gh --version 2>$null | Select-Object -First 1))"
+
 # gh auth
 & gh auth status *> $null
 if ($LASTEXITCODE -ne 0) {
@@ -491,3 +503,22 @@ Write-Host "[INFO] Wrote migration results with Migration_Status column: $OUTPUT
 # Clean up per-repo log files - their content was already streamed to the Actions run log
 Get-ChildItem -Path . -Filter 'migration-*.txt' | Remove-Item -Force -ErrorAction SilentlyContinue
 Write-Host "[INFO] Cleaned up per-repo log files."
+
+if ($FAILED.Count -eq 0) {
+  Write-Host "::notice::All $total_repos repositories migrated successfully"
+  exit 0
+} elseif ($MIGRATED.Count -eq 0) {
+  Write-Host "::error::All $total_repos repositories failed to migrate"
+  foreach ($item in $FAILED) {
+    $p = $item.Split(',',6)
+    Write-Host "::error::Failed: $($p[3])/$($p[4]) ($($p[0])/$($p[2]))"
+  }
+  exit 1
+} else {
+  Write-Host "::warning::Migration completed with partial success: $($MIGRATED.Count) succeeded, $($FAILED.Count) failed out of $total_repos total"
+  foreach ($item in $FAILED) {
+    $p = $item.Split(',',6)
+    Write-Host "::warning::Failed: $($p[3])/$($p[4]) ($($p[0])/$($p[2]))"
+  }
+  exit 0
+}
