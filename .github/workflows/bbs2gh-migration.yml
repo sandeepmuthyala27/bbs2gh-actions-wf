@@ -3,22 +3,22 @@ name: bbs2gh-migration
 on:
   workflow_dispatch:
     inputs:
-      # bbs_base_url:
-      #   description: "Bitbucket Server base URL. Leave blank to use the BBS_BASE_URL repo variable. (https://bitbucket.example.com:7990)"
-      #   required: false
-      #   default: 'https://scmivenixclone.kabi.ads.fresenius.com'
-      #   type: string
+      bbs_base_url:
+        description: "Bitbucket Server base URL. Leave blank to use the BBS_BASE_URL repo variable. (https://bitbucket.example.com:7990)"
+        required: false
+        default: ''
+        type: string
       max_concurrent:
-        description: Maximum concurrent migrations (5)
+        description: Maximum concurrent migrations (1-20)
         required: false
         default: '5'
         type: choice
-        options: ['1','2','3','4','5']
-      # target_api_url:
-      #   description: "GitHub data residency API base URL. (https://api.<tenant>.ghe.com)"
-      #   required: false
-      #   default: 'https://api.fresenius.ghe.com'
-      #   type: string
+        options: ['1','2','3','4','5','6','7','8','9','10','12','15','20']
+      target_api_url:
+        description: "GitHub data residency API base URL. (https://api.<tenant>.ghe.com)"
+        required: false
+        default: ''
+        type: string
       verbose:
         description: Enable verbose logging (sets VERBOSE=1 and uploads *.log artifacts if produced)
         required: false
@@ -27,12 +27,23 @@ on:
       runner_label:
         description: "Run on GitHub-hosted or self-hosted runners."
         required: false
-        default: self-hosted
+        default: ubuntu-latest
         type: choice
         options:
           - ubuntu-latest
           - self-hosted
-      
+      migrate_timeout_minutes:
+        description: "Job timeout (minutes). GitHub-hosted max: 360; self-hosted max: 35 days."
+        required: false
+        default: '360'
+        type: choice
+        options:
+          - '360'
+          - '720'
+          - '1440'
+          - '2880'
+          - '4320'
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -44,12 +55,12 @@ jobs:
   prechecks:
     name: Pre-check
     runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: 7200
+    timeout-minutes: 30
     outputs:
       open_pr_repos: ${{ steps.precheck-meta.outputs.open_pr_repos }}
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v4
 
       - name: Resolve BBS_BASE_URL (input -> repo var)
         shell: bash
@@ -83,7 +94,7 @@ jobs:
         env:
           BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
           BBS_PAT: ${{ secrets.BBS_PAT }}
-          BBS_AUTH_TYPE: ${{ secrets.BBS_AUTH_TYPE }}
+          BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
           BBS_USERNAME: ${{ secrets.BBS_USERNAME }}
           BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
         run: |
@@ -131,7 +142,7 @@ jobs:
 
       - name: Upload prechecks output
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v4
         with:
           name: bbs-prechecks-${{ github.run_id }}
           path: bbs_pr_validation_output-*.csv
@@ -141,7 +152,7 @@ jobs:
   migrate:
     name: Migration
     runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: 7200
+    timeout-minutes: ${{ fromJSON(inputs.migrate_timeout_minutes) }}
     needs: [prechecks]
     environment: migration-approval
     env:
@@ -150,7 +161,7 @@ jobs:
       VERBOSE: ${{ inputs.verbose && '1' || '0' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v4
 
       - name: Write migration start summary
         shell: bash
@@ -294,7 +305,7 @@ jobs:
 
       - name: Upload migration logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v4
         with:
           name: migration-logs-${{ github.run_id }}
           path: |
@@ -305,7 +316,7 @@ jobs:
 
       - name: Upload migration output CSV
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v4
         with:
           name: migration-output-csv-${{ github.run_id }}
           path: ${{ runner.temp }}/bbs2gh-run/repo_migration_output-*.csv
@@ -349,7 +360,7 @@ jobs:
   validate:
     name: Post-migration Validation
     runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: 7200
+    timeout-minutes: 120
     needs: [migrate]
     if: ${{ needs.migrate.result != 'cancelled' }}
     env:
@@ -357,7 +368,7 @@ jobs:
       GH_PAT: ${{ secrets.GH_PAT }}
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v4
 
       - name: Write validation start summary
         shell: bash
@@ -414,7 +425,7 @@ jobs:
           mkdir -p "${{ runner.temp }}/bbs2gh-validate"
 
       - name: Download migration output CSV
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           name: migration-output-csv-${{ github.run_id }}
           path: ${{ runner.temp }}/bbs2gh-migrate-out
@@ -470,7 +481,7 @@ jobs:
           GH_TOKEN: ''
           BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
           BBS_PAT: ${{ secrets.BBS_PAT }}
-          BBS_AUTH_TYPE: ${{ secrets.BBS_AUTH_TYPE }}
+          BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
           BBS_USERNAME: ${{ secrets.BBS_USERNAME }}
           BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
         run: |
@@ -513,7 +524,7 @@ jobs:
 
       - name: Upload validation outputs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v4
         with:
           name: validation-results-${{ github.run_id }}
           path: |
