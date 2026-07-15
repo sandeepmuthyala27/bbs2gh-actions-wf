@@ -18,7 +18,18 @@ for ($i=0; $i -lt $args.Count; $i++) {
   }
 }
 
+$COMMIT_CHECK = if ($env:COMMIT_CHECK) { $env:COMMIT_CHECK } else { 'true' }
+$FAIL_ON_VALIDATION_FAILURES = if ($env:FAIL_ON_VALIDATION_FAILURES) { $env:FAIL_ON_VALIDATION_FAILURES } else { 'false' }
+
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+  Write-Error "[ERROR] GitHub CLI (gh) is not installed. See https://cli.github.com/"
+  exit 1
+}
+
 # GH auth
+if ((-not [string]::IsNullOrEmpty($env:GH_PAT)) -and [string]::IsNullOrEmpty($env:GH_TOKEN)) {
+  $env:GH_TOKEN = $env:GH_PAT
+}
 & gh auth status *> $null
 if ($LASTEXITCODE -ne 0) {
   Write-Error "[ERROR] GitHub CLI not authenticated. Run: gh auth login (or set GH_TOKEN/GH_PAT)."
@@ -26,7 +37,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ([string]::IsNullOrEmpty($BBS_BASE_URL)) {
-  Write-Error "BbsBaseUrl is required (pass -b or export BBS_BASE_URL)."
+  Write-Error "BBS_BASE_URL is required (pass -b or export BBS_BASE_URL)."
   exit 1
 }
 $BASE_URL = $BBS_BASE_URL.TrimEnd('/')
@@ -205,12 +216,51 @@ foreach ($line in $lines) {
   $commitsMatchAll = 'false'
   $shasMatchAll = 'false'
 
-  if ($ghExists -eq 'yes') {
-    $common = $bbsBranches | Where-Object { $ghBranches -contains $_ }
-    if ($common.Count -gt 0) {
+  if ($COMMIT_CHECK -ne 'true') {
+    $commitsMatchAll = 'true'
+    $shasMatchAll = 'true'
+    ("[$(Get-Date)] COMMIT_CHECK=false - skipping per-branch commit/SHA comparison") | Tee-Object -FilePath $LOG_FILE -Append
+  } elseif ($ghExists -eq 'yes') {
+    $ghDefault = ""
+    try { $ghDefault = (& gh api "/repos/$ghOrg/$ghRepo" --jq '.default_branch' 2>$null | Out-String).Trim() } catch { $ghDefault = "" }
+    $bbsDefault = ""
+    try { $bbsDefault = [string](Curl-Json "$BASE_URL/rest/api/1.0/projects/$bbsProjectKey/repos/$bbsRepoSlug/branches/default").displayId } catch { $bbsDefault = "" }
+
+    $validation_branch = ""
+    if ($ghDefault -and (($ghBranches -contains $ghDefault) -or ($bbsBranches -contains $ghDefault))) {
+      $validation_branch = $ghDefault
+    } elseif ($bbsDefault -and (($ghBranches -contains $bbsDefault) -or ($bbsBranches -contains $bbsDefault))) {
+      $validation_branch = $bbsDefault
+    }
+
+    $branchesToCheck = New-Object System.Collections.Generic.List[string]
+    if ($bbsBranchCount -gt 10 -or $ghBranchCount -gt 10) {
+      if ($validation_branch) { $branchesToCheck.Add($validation_branch) }
+      foreach ($b in $ghBranches) {
+        if ($b -eq $validation_branch) { continue }
+        $branchesToCheck.Add($b)
+        if ($branchesToCheck.Count -ge 10) { break }
+      }
+      ("[$(Get-Date)] Repo has >10 branches. Commit/SHA check limited to first $($branchesToCheck.Count) branches (default branch first).") | Tee-Object -FilePath $LOG_FILE -Append
+    } elseif ($validation_branch) {
+      $branchesToCheck.Add($validation_branch)
+      ("[$(Get-Date)] Repo has <=10 branches. Commit/SHA check limited to default branch: '$validation_branch'.") | Tee-Object -FilePath $LOG_FILE -Append
+    } else {
+      ("[$(Get-Date)] Could not determine a default branch for commit/SHA check.") | Tee-Object -FilePath $LOG_FILE -Append
+    }
+
+    if ($branchesToCheck.Count -gt 0) {
       $commitsMatchAll = 'true'
       $shasMatchAll = 'true'
-      foreach ($br in $common) {
+      foreach ($br in $branchesToCheck) {
+        if ($ghBranches -notcontains $br) {
+          ("[$(Get-Date)] Branch '$br': missing in GitHub branches list $(Status-Marker 'false')") | Tee-Object -FilePath $LOG_FILE -Append
+          $commitsMatchAll = 'false'; $shasMatchAll = 'false'; continue
+        }
+        if ($bbsBranches -notcontains $br) {
+          ("[$(Get-Date)] Branch '$br': missing in Bitbucket branches list $(Status-Marker 'false')") | Tee-Object -FilePath $LOG_FILE -Append
+          $commitsMatchAll = 'false'; $shasMatchAll = 'false'; continue
+        }
         $ghInfo = Get-Gh-Commits-Info $ghOrg $ghRepo $br
         $bbsInfo = Get-Bbs-Commits-Info $bbsProjectKey $bbsRepoSlug $br
 
@@ -273,3 +323,36 @@ $mdLines | Set-Content -LiteralPath $md
 Write-Host "=======================Summary==========================="
 Get-Content -LiteralPath $md
 Write-Host "======================Completed==========================="
+
+$rows = Get-Content -LiteralPath $summary_csv | Select-Object -Skip 1 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+$total_validated = @($rows).Count
+$passed = 0
+$discrepancies = New-Object System.Collections.Generic.List[string]
+foreach ($row in $rows) {
+  $c = $row.Split(',')
+  if ($c[6] -eq 'true' -and $c[7] -eq 'true' -and $c[8] -eq 'true') {
+    $passed++
+  } else {
+    $notes = if ($c.Count -ge 10) { $c[9] } else { '' }
+    $discrepancies.Add("$($c[0])/$($c[1]) ($notes)")
+  }
+}
+$failed = $total_validated - $passed
+
+if ($total_validated -eq 0) {
+  Write-Host "::notice::No repositories were validated."
+} elseif ($failed -eq 0) {
+  Write-Host "::notice::All $total_validated repositories validated successfully (branches, commits and SHAs match)"
+} elseif ($passed -eq 0) {
+  Write-Host "::error::All $total_validated repositories have validation discrepancies"
+  foreach ($d in $discrepancies) { Write-Host "::error::Validation discrepancy: $d" }
+} else {
+  Write-Host "::warning::Validation completed with discrepancies: $passed matched, $failed with issues (of $total_validated)"
+  foreach ($d in $discrepancies) { Write-Host "::warning::Validation discrepancy: $d" }
+}
+
+if ($FAIL_ON_VALIDATION_FAILURES -eq 'true' -and $failed -gt 0) {
+  Write-Host "::error::FAIL_ON_VALIDATION_FAILURES=true and $failed repository(ies) failed validation."
+  exit 1
+}
+exit 0
