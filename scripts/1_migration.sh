@@ -441,7 +441,7 @@ while (( ${#QUEUE[@]} > 0 )) || (( ${#JOB_PIDS[@]} > 0 )); do
     repo_info="${QUEUE[0]}"
     QUEUE=("${QUEUE[@]:1}")
 
-    IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${repo_info}"
+    IFS=$',' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${repo_info}"
     log_file="migration-${github_org}-${github_repo}-$(date +%Y%m%d-%H%M%S).txt"
 
     # Update CSV with "In Progress" + log file
