@@ -36,6 +36,14 @@ if ([string]::IsNullOrEmpty($env:BBS_BASE_URL)) {
 }
 $BASE_URL = $env:BBS_BASE_URL.TrimEnd('/')
 
+$LOG_FILE = "bbs-prechecks-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+function Write-Log {
+  param([string]$Message, [string]$Level = 'INFO')
+  $color = switch ($Level) { 'OK' {'Green'} 'WARNING' {'Yellow'} 'ERROR' {'Red'} default {'Cyan'} }
+  Write-Host "[$Level] $Message" -ForegroundColor $color
+  Add-Content -LiteralPath $LOG_FILE -Value "[$Level] $Message"
+}
+
 function Get-AuthHeader {
   if (-not [string]::IsNullOrEmpty($env:BBS_PAT)) {
     return @{ Authorization = "Bearer $($env:BBS_PAT)" }
@@ -54,11 +62,54 @@ function Curl-Json([string]$Url) {
   return Invoke-RestMethod -Headers $hdr -Uri $Url -Method Get
 }
 
+function Get-BbsInstallPath {
+  if ($env:BITBUCKET_HOME -and (Test-Path -LiteralPath $env:BITBUCKET_HOME -PathType Container)) {
+    Write-Log "Bitbucket Server home found via BITBUCKET_HOME: $($env:BITBUCKET_HOME)" 'OK'
+    return
+  }
+  foreach ($p in @('/var/atlassian/application-data/bitbucket','/opt/atlassian/bitbucket','C:\Atlassian\ApplicationData\Bitbucket','C:\Program Files\Atlassian\Bitbucket')) {
+    if (Test-Path -LiteralPath $p -PathType Container) {
+      $env:BITBUCKET_HOME = $p
+      Write-Log "Bitbucket Server found at default location: $p" 'OK'
+      return
+    }
+  }
+  $launcher = Get-Command start-bitbucket.sh, start-bitbucket.bat, bitbucket -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($launcher) {
+    $bbsHome = Split-Path -Parent (Split-Path -Parent $launcher.Source)
+    if (-not $bbsHome) { $bbsHome = Split-Path -Parent $launcher.Source }
+    $env:BITBUCKET_HOME = $bbsHome
+    Write-Log "Bitbucket Server launcher found on PATH: $($launcher.Source) (home: $bbsHome)" 'OK'
+    return
+  }
+  if (-not [Console]::IsInputRedirected) {
+    $userPath = Read-Host "Bitbucket Server install not found (checked BITBUCKET_HOME, default dirs, PATH). Enter its path (blank to skip)"
+    if ($userPath -and (Test-Path -LiteralPath $userPath -PathType Container)) {
+      $env:BITBUCKET_HOME = $userPath
+      Write-Log "Using Bitbucket Server path: $userPath" 'OK'
+    } elseif ($userPath) {
+      Write-Log "Path does not exist: $userPath. Continuing without a local Bitbucket Server path." 'WARNING'
+    } else {
+      Write-Log "No path provided. Continuing without a local Bitbucket Server path." 'WARNING'
+    }
+  } else {
+    Write-Log "Bitbucket Server install not found locally. Continuing (remote/SSH migration does not require a local install)." 'WARNING'
+  }
+}
+Get-BbsInstallPath
+
 # Preflight auth test
 try {
   $null = Invoke-RestMethod -Headers (Get-AuthHeader) -Uri "$BASE_URL/rest/api/1.0/projects?limit=1" -Method Get
 } catch {
-  Write-Error "[ERROR] Bitbucket auth failed. Verify BBS_BASE_URL and credentials."
+  $code = 0
+  if ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $code = [int]$_.Exception.Response.StatusCode }
+  switch ($code) {
+    { $_ -in 401,403 } { Write-Log "Bitbucket auth failed (HTTP $code). Verify BBS_PAT / credentials and permissions." 'ERROR' }
+    404               { Write-Log "Bitbucket endpoint not found (HTTP 404). Verify BBS_BASE_URL: $BASE_URL" 'ERROR' }
+    0                 { Write-Log "Network/DNS/TLS issue reaching Bitbucket. Verify connectivity to $BASE_URL." 'ERROR' }
+    default           { Write-Log "Bitbucket preflight failed (HTTP $code) for $BASE_URL." 'ERROR' }
+  }
   exit 1
 }
 
@@ -106,12 +157,19 @@ function Discover-Repos-For-Project([string]$projectKey) {
 }
 
 function Get-Open-Pr-Count([string]$projectKey, [string]$repoSlug) {
-  # Preserve original logic (includes an immediate break in the bash script)
   $start = 0
   $total = 0
   while ($true) {
-    $null = Curl-Json "$BASE_URL/rest/api/1.0/projects/$projectKey/repos/$repoSlug/pull-requests?state=OPEN&limit=100&start=$start"
-    break
+    try {
+      $resp = Curl-Json "$BASE_URL/rest/api/1.0/projects/$projectKey/repos/$repoSlug/pull-requests?state=OPEN&limit=100&start=$start"
+    } catch {
+      return "ERROR"
+    }
+    if ($resp.values) { $total += @($resp.values).Count }
+    if ($resp.isLastPage -eq $true) { break }
+    $nextStart = $resp.nextPageStart
+    if ($null -eq $nextStart -or $nextStart -eq '') { break }
+    $start = [int]$nextStart
   }
   return $total
 }
@@ -158,6 +216,7 @@ $results_tmp = [System.IO.Path]::GetTempFileName()
 "project_key,project_name,repo_slug,is_archived,open_pr_count,warnings,ready_to_migrate" | Set-Content -LiteralPath $results_tmp
 
 $total_open_prs = 0
+$prCheckFailed = $false
 foreach ($line in (Get-Content -LiteralPath $rows_tmp)) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
   $parts = $line.Split(',')
@@ -166,7 +225,14 @@ foreach ($line in (Get-Content -LiteralPath $rows_tmp)) {
   $repoSlug = if ($parts.Count -ge 3) { $parts[2] } else { '' }
   $isArchived = if ($parts.Count -ge 4) { $parts[3] } else { '' }
 
-  $openPrs = [int](Get-Open-Pr-Count $projKey $repoSlug)
+  $prResult = Get-Open-Pr-Count $projKey $repoSlug
+  if ($prResult -eq "ERROR") {
+    $prCheckFailed = $true
+    Write-Host "[ERROR] $projKey/${repoSlug}: failed to query open PRs (API error)"
+    "$projKey,$projName,$repoSlug,$(if([string]::IsNullOrEmpty($isArchived)){'false'}else{$isArchived}),ERROR,API_FAILURE,false" | Add-Content -LiteralPath $results_tmp
+    continue
+  }
+  $openPrs = [int]$prResult
   $total_open_prs += $openPrs
 
   $warns = ""
@@ -203,3 +269,14 @@ Write-Host ""
 Write-Host "[SUMMARY] Total repos: $total_repos"
 Write-Host "Open PRs total: $total_open_prs"
 Write-Host "======================Completed============================="
+
+$hasActiveItems = $total_open_prs -gt 0
+if ($prCheckFailed -and -not $hasActiveItems) {
+  Write-Host "`nValidation checks could not be completed due to API failures. Please review errors before proceeding.`n" -ForegroundColor Red
+} elseif ($prCheckFailed -and $hasActiveItems) {
+  Write-Host "`nOpen pull requests detected, but some validation checks failed. Review warnings and errors before proceeding.`n" -ForegroundColor Yellow
+} elseif (-not $prCheckFailed -and $hasActiveItems) {
+  Write-Host "`nOpen pull requests found. Continue with migration if you have reviewed and are comfortable proceeding.`n" -ForegroundColor Yellow
+} else {
+  Write-Host "`nNo open pull requests detected. You can proceed with migration.`n" -ForegroundColor Green
+}
