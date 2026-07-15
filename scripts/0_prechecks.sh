@@ -111,8 +111,8 @@ get_open_pr_count() {
   local projectKey="$1" repoSlug="$2"
   # Use limit=1 and read the top-level .size — a single call gives the full count
   local resp
-  resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${repoSlug}/pull-requests?state=OPEN&limit=1")" || { echo 0; return; }
-  echo "$resp" | jq '.size // 0'
+  resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${repoSlug}/pull-requests?state=OPEN&limit=1")" || { echo "ERROR"; return; }
+  echo "$resp" | jq -r '.size // 0' 2>/dev/null || echo "ERROR"
 }
 
 echo ""
@@ -147,8 +147,16 @@ results_tmp="$(mktemp)"
 echo "project_key,project_name,repo_slug,is_archived,open_pr_count,warnings,ready_to_migrate" > "$results_tmp"
 
 total_open_prs=0
+pr_check_failed=false
 while IFS=',' read -r projKey projName repoSlug isArchived _rest; do
   openPrs="$(get_open_pr_count "$projKey" "$repoSlug")"
+  if [[ "$openPrs" == "ERROR" || ! "$openPrs" =~ ^[0-9]+$ ]]; then
+    pr_check_failed=true
+    echo "[ERROR] ${projKey}/${repoSlug}: failed to query open PRs (API error)"
+    printf "%s,%s,%s,%s,%s,%s,%s\n" \
+      "$projKey" "$projName" "$repoSlug" "${isArchived:-false}" "ERROR" "API_FAILURE" "false" >> "$results_tmp"
+    continue
+  fi
   total_open_prs=$(( total_open_prs + openPrs ))
   warns=""
   if (( openPrs > 0 )); then
@@ -176,20 +184,21 @@ else
 fi
 
 total_repos="$(($(wc -l < "$rows_tmp")))"
-ready_repos=0
-[[ -f "$ready_tmp" ]] && ready_repos="$(wc -l < "$ready_tmp" | tr -d ' ')"
-repos_with_open_prs=$(( total_repos - ready_repos ))
 
 echo ""
 echo "[SUMMARY] Total repos: $total_repos"
 echo "Open PRs total: $total_open_prs"
 echo "======================Completed============================="
 
-if (( total_repos == 0 )); then
-  echo "::notice::No repositories found to check."
-elif (( repos_with_open_prs == 0 )); then
-  echo "::notice::All ${total_repos} repositories are ready to migrate (no open PRs)"
+hasActiveItems=false
+(( total_open_prs > 0 )) && hasActiveItems=true
+
+if [[ "$pr_check_failed" == true && "$hasActiveItems" == false ]]; then
+  echo -e "\n\033[31mValidation checks could not be completed due to API failures. Please review errors before proceeding.\033[0m\n"
+elif [[ "$pr_check_failed" == true && "$hasActiveItems" == true ]]; then
+  echo -e "\n\033[33mOpen pull requests detected, but some validation checks failed. Review warnings and errors before proceeding.\033[0m\n"
+elif [[ "$pr_check_failed" == false && "$hasActiveItems" == true ]]; then
+  echo -e "\n\033[33mOpen pull requests found. Continue with migration if you have reviewed and are comfortable proceeding.\033[0m\n"
 else
-  echo "::warning::${repos_with_open_prs} of ${total_repos} repositories have open PRs"
-  awk -F',' 'NR>1 && $7=="false"{printf "::warning::Open PRs: %s/%s (%s open)\n",$1,$3,$5}' "$OUTPUT_CSV"
+  echo -e "\n\033[32mNo open pull requests detected. You can proceed with migration.\033[0m\n"
 fi
