@@ -341,7 +341,8 @@ migrate_repository() {
       --ssh-user "${SSH_USER}" \
       --ssh-private-key "${resolvedKey}" \
       --target-api-url "${TARGET_API_URL}" \
-      --target-repo-visibility "${gh_repo_visibility}"
+      --target-repo-visibility "${gh_repo_visibility}" \
+      --no-ssl-verify \
 
     # Assess log content
     if grep -q "No operation will be performed" "${log_file}"; then
@@ -402,7 +403,7 @@ while IFS= read -r line; do
     continue
   fi
 
-  QUEUE+=("${projectKey}  ${projectName}  ${repoSlug}  ${github_org}  ${github_repo}  ${gh_repo_visibility}")
+  QUEUE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
 done < "${CSV_PATH}"
 
 ############################################
@@ -441,7 +442,7 @@ while (( ${#QUEUE[@]} > 0 )) || (( ${#JOB_PIDS[@]} > 0 )); do
     repo_info="${QUEUE[0]}"
     QUEUE=("${QUEUE[@]:1}")
 
-    IFS=',' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${repo_info}"
+    IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${repo_info}"
     log_file="migration-${github_org}-${github_repo}-$(date +%Y%m%d-%H%M%S).txt"
 
     # Update CSV with "In Progress" + log file
