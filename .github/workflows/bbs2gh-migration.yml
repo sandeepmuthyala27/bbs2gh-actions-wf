@@ -27,7 +27,7 @@ on:
       runner_label:
         description: "Run on GitHub-hosted or self-hosted runners."
         required: false
-        default: self-hosted
+        default: ubuntu-latest
         type: choice
         options:
           - ubuntu-latest
