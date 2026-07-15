@@ -341,9 +341,7 @@ migrate_repository() {
       --ssh-user "${SSH_USER}" \
       --ssh-private-key "${resolvedKey}" \
       --target-api-url "${TARGET_API_URL}" \
-      --target-repo-visibility "${gh_repo_visibility}" \
-      --no-ssl-verify \
-      --bbs-shared-home "/var/bitbucket-home/shared"
+      --target-repo-visibility "${gh_repo_visibility}"
 
     # Assess log content
     if grep -q "No operation will be performed" "${log_file}"; then
@@ -404,7 +402,7 @@ while IFS= read -r line; do
     continue
   fi
 
-  QUEUE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
+  QUEUE+=("${projectKey}  ${projectName}  ${repoSlug}  ${github_org}  ${github_repo}  ${gh_repo_visibility}")
 done < "${CSV_PATH}"
 
 ############################################
