@@ -131,6 +131,38 @@ get_gh_branches_with_shas() {
   gh api "/repos/${org}/${repo}/branches" --paginate | jq -r '.[] | [.name, .commit.sha] | @tsv'
 }
 
+urlencode_uri() { jq -rn --arg s "$1" '$s|@uri'; }
+
+get_bbs_commit_count() {
+  local projectKey="$1" repoSlug="$2" branch="$3"
+  local total=0 start=0 limit=1000 encBranch; encBranch="$(urlencode_uri "$branch")"
+  while :; do
+    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${repoSlug}/commits?until=${encBranch}&limit=${limit}&start=${start}")"
+    local cnt; cnt="$(echo "$resp" | jq '.values | length' 2>/dev/null || echo 0)"
+    [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
+    total=$(( total + cnt ))
+    local isLast; isLast="$(echo "$resp" | jq -r '.isLastPage' 2>/dev/null)"
+    local nextStart; nextStart="$(echo "$resp" | jq -r '.nextPageStart // empty' 2>/dev/null)"
+    [[ "$isLast" == "true" ]] && break
+    [[ -z "$nextStart" ]] && break
+    start="$nextStart"
+  done
+  echo "$total"
+}
+
+get_gh_commit_count() {
+  local org="$1" repo="$2" branch="$3"
+  local total=0 page=1 per=100 encBranch; encBranch="$(urlencode_uri "$branch")"
+  while :; do
+    local count; count="$(gh api "/repos/${org}/${repo}/commits?sha=${encBranch}&page=${page}&per_page=${per}" 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    total=$(( total + count ))
+    (( count < per )) && break
+    page=$(( page + 1 ))
+  done
+  echo "$total"
+}
+
 status_marker() { # $1: ok|true|false
   [[ "$1" == "true" ]] && echo "✅ Matching" || echo "❌ Not Matching"
 }
@@ -201,7 +233,7 @@ if [[ ${#missing_cols[@]} -gt 0 ]]; then
 fi
 
 summary_csv="validation-summary-$(date +'%Y%m%d-%H%M%S').csv"
-echo "github_org,github_repo,bbs_project_key,bbs_repo,branch_count_bbs,branch_count_gh,branch_count_match,shas_match_all,gh_notes" > "$summary_csv"
+echo "github_org,github_repo,bbs_project_key,bbs_repo,branch_count_bbs,branch_count_gh,branch_count_match,commits_match_all,shas_match_all,gh_notes" > "$summary_csv"
 
 echo "==> Starting validation..."
 
@@ -213,7 +245,9 @@ validate_repo() {
   local out_file="$5"  # temp file for this repo's CSV row + log lines
 
   {
-    echo "[$(date)] Processing: ${bbsProjectKey}/${bbsRepoSlug} -> ${ghOrg}/${ghRepo}"
+    echo "============================================================"
+    echo "ℹ️  [$(date -u +%Y-%m-%dT%H:%M:%SZ)] Validating: ${bbsProjectKey}/${bbsRepoSlug} -> ${ghOrg}/${ghRepo}"
+    echo "============================================================"
 
     # A — Check GitHub repo exists
     local ghExists="yes"
@@ -238,7 +272,11 @@ validate_repo() {
     # C — Branch count comparison
     local bbsBranchCount="${#bbsSHAmap[@]}" ghBranchCount="${#ghSHAmap[@]}"
     local branchCountOk="false"; [[ "$bbsBranchCount" -eq "$ghBranchCount" ]] && branchCountOk="true"
-    echo "[$(date)] Branch Count: BBS=${bbsBranchCount} GitHub=${ghBranchCount} $(status_marker "$branchCountOk")"
+    if [[ "$branchCountOk" == "true" ]]; then
+      echo "✅ Branch Count MATCHED | BBS=${bbsBranchCount} GitHub=${ghBranchCount}"
+    else
+      echo "❌ Branch Count MISMATCH | BBS=${bbsBranchCount} GitHub=${ghBranchCount}"
+    fi
 
     local missingInGH missingInBBS
     missingInGH=$(comm -23 \
@@ -247,14 +285,22 @@ validate_repo() {
     missingInBBS=$(comm -13 \
       <(printf "%s\n" "${!bbsSHAmap[@]}" | sort) \
       <(printf "%s\n" "${!ghSHAmap[@]}"  | sort) || true)
-    [[ -n "$missingInGH" ]]  && echo "[$(date)] Branches missing in GitHub: $(echo "$missingInGH" | tr '\n' ', ')"
-    [[ -n "$missingInBBS" ]] && echo "[$(date)] Branches missing in Bitbucket: $(echo "$missingInBBS" | tr '\n' ', ')"
+    if [[ -n "$missingInGH" ]]; then
+      echo "❌ Branches missing in GitHub: $(echo "$missingInGH" | tr '\n' ' ' | sed 's/ *$//')"
+    else
+      echo "✅ No branches missing in GitHub"
+    fi
+    if [[ -n "$missingInBBS" ]]; then
+      echo "❌ Extra branches in GitHub (not in Bitbucket): $(echo "$missingInBBS" | tr '\n' ' ' | sed 's/ *$//')"
+    else
+      echo "✅ No extra branches found"
+    fi
 
-    # D — SHA comparison
-    local shasMatchAll="false"
+    # D — Commit count + SHA comparison
+    local commitsMatchAll="false" shasMatchAll="false"
     if [[ "${COMMIT_CHECK}" != "true" ]]; then
-      shasMatchAll="true"
-      echo "[$(date)] COMMIT_CHECK=false - skipping per-branch SHA comparison"
+      commitsMatchAll="true"; shasMatchAll="true"
+      echo "ℹ️ COMMIT_CHECK=false - skipping per-branch commit/SHA comparison"
     elif [[ "$ghExists" == "yes" && "${#bbsSHAmap[@]}" -gt 0 && "${#ghSHAmap[@]}" -gt 0 ]]; then
       local ghDefault bbsDefault validation_branch=""
       ghDefault="$(gh api "/repos/${ghOrg}/${ghRepo}" --jq '.default_branch' 2>/dev/null || true)"
@@ -274,31 +320,38 @@ validate_repo() {
         branches_to_check+=("$name")
       done
       if (( bbsBranchCount > 10 || ghBranchCount > 10 )); then
-        echo "[$(date)] Repo has >10 branches. SHA check limited to ${#branches_to_check[@]} branch(es) (default branch first, max 10)."
+        echo "ℹ️ Commit validation running only for first ${#branches_to_check[@]} branches (default branch first, max 10)"
       elif (( ${#branches_to_check[@]} > 0 )); then
-        echo "[$(date)] SHA check covers ${#branches_to_check[@]} branch(es) (default branch first, max 10)."
+        echo "ℹ️ Commit validation covering ${#branches_to_check[@]} branch(es) (default branch first, max 10)"
       else
-        echo "[$(date)] Could not determine any branch for SHA check."
+        echo "ℹ️ Could not determine any branch for commit/SHA check"
       fi
 
       if (( ${#branches_to_check[@]} > 0 )); then
-        shasMatchAll="true"
+        commitsMatchAll="true"; shasMatchAll="true"
         local br
         for br in "${branches_to_check[@]}"; do
           [[ -z "$br" ]] && continue
           if [[ -z "${ghSHAmap[$br]:-}" ]]; then
-            echo "[$(date)] Branch '$br': missing in GitHub branches list $(status_marker false)"
-            shasMatchAll="false"; continue
+            echo "Branch '$br': missing in GitHub branches list ❌ Not Matching"
+            commitsMatchAll="false"; shasMatchAll="false"; continue
           fi
           if [[ -z "${bbsSHAmap[$br]:-}" ]]; then
-            echo "[$(date)] Branch '$br': missing in Bitbucket branches list $(status_marker false)"
-            shasMatchAll="false"; continue
+            echo "Branch '$br': missing in Bitbucket branches list ❌ Not Matching"
+            commitsMatchAll="false"; shasMatchAll="false"; continue
           fi
+          local bbsCount ghCount countOk
+          bbsCount="$(get_bbs_commit_count "$bbsProjectKey" "$bbsRepoSlug" "$br")"
+          ghCount="$(get_gh_commit_count "$ghOrg" "$ghRepo" "$br")"
+          countOk="false"; [[ "$bbsCount" == "$ghCount" ]] && countOk="true"
+          [[ "$countOk" == "false" ]] && commitsMatchAll="false"
+          echo "Branch '$br': BBS Commits=${bbsCount} | GitHub Commits=${ghCount} | $(status_marker "$countOk")"
+
           local bbsSha="${bbsSHAmap[$br]:-}" ghSha="${ghSHAmap[$br]:-}"
           local shaOk="false"
           [[ -n "$ghSha" && "$ghSha" == "$bbsSha" ]] && shaOk="true"
           [[ "$shaOk" == "false" ]] && shasMatchAll="false"
-          echo "[$(date)] Branch '$br': BBS SHA=${bbsSha} GitHub SHA=${ghSha} $(status_marker "$shaOk")"
+          echo "Branch '$br': BBS SHA=${bbsSha} | GitHub SHA=${ghSha} | $(status_marker "$shaOk")"
         done
       fi
     fi
@@ -310,12 +363,12 @@ validate_repo() {
       gh_notes="no branches on GH"
     fi
 
-    echo "[$(date)] Validation complete for ${ghOrg}/${ghRepo}"
+    echo "✅ Validation completed for: ${ghOrg}/${ghRepo}"
     # Write the CSV row as a sentinel line prefixed with CSV: so we can extract it
-    printf 'CSV:%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf 'CSV:%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$ghOrg" "$ghRepo" "$bbsProjectKey" "$bbsRepoSlug" \
       "$bbsBranchCount" "$ghBranchCount" "$branchCountOk" \
-      "$shasMatchAll" "$gh_notes"
+      "$commitsMatchAll" "$shasMatchAll" "$gh_notes"
   } > "$out_file" 2>&1
 }
 
@@ -351,17 +404,18 @@ echo "[$(date)] All validations from CSV completed" | tee -a "$LOG_FILE"
 # Markdown table (name matches the summary CSV for easy correlation)
 md="${summary_csv%.csv}.md"
 {
-  echo "| GitHub Repo | BBS Repo | Branches (BBS/GH) | Count ✓ | SHAs ✓ | Notes |"
-  echo "|-|-|-|-|-|-|"
+  echo "| GitHub Repo | BBS Repo | Branches (BBS/GH) | Count ✓ | Commits ✓ | SHAs ✓ | Notes |"
+  echo "|-|-|-|-|-|-|-|"
   # Read rows directly from the CSV file (no pipe → no subshell surprises)
-  while IFS=',' read -r ghOrg ghRepo bbsKey bbsRepo bcB ghC bcOk shaOk notes; do
+  while IFS=',' read -r ghOrg ghRepo bbsKey bbsRepo bcB ghC bcOk commitsOk shaOk notes; do
     # Skip empty lines
     [[ -z "$ghOrg" && -z "$ghRepo" ]] && continue
-    printf "| %s/%s | %s/%s | %s/%s | %s | %s | %s |\n" \
+    printf "| %s/%s | %s/%s | %s/%s | %s | %s | %s | %s |\n" \
       "$ghOrg" "$ghRepo" \
       "$bbsKey" "$bbsRepo" \
       "$bcB" "$ghC" \
       "$( [[ "$bcOk" == "true" ]] && echo "✅" || echo "❌" )" \
+      "$( [[ "$commitsOk" == "true" ]] && echo "✅" || echo "❌" )" \
       "$( [[ "$shaOk" == "true" ]] && echo "✅" || echo "❌" )" \
       "${notes}"
   done < <(tail -n +2 "$summary_csv")
@@ -371,19 +425,19 @@ cat ${md}
 echo "======================Completed==========================="
 
 total_validated=$(awk -F',' 'NR>1{c++} END{print c+0}' "$summary_csv")
-passed=$(awk -F',' 'NR>1 && $7=="true" && $8=="true"{c++} END{print c+0}' "$summary_csv")
+passed=$(awk -F',' 'NR>1 && $7=="true" && $8=="true" && $9=="true"{c++} END{print c+0}' "$summary_csv")
 failed=$(( total_validated - passed ))
 
 if (( total_validated == 0 )); then
   echo "::notice::No repositories were validated."
 elif (( failed == 0 )); then
-  echo "::notice::All ${total_validated} repositories validated successfully (branches and SHAs match)"
+  echo "::notice::All ${total_validated} repositories validated successfully (branches, commits and SHAs match)"
 elif (( passed == 0 )); then
   echo "::error::All ${total_validated} repositories have validation discrepancies"
-  awk -F',' 'NR>1 && !($7=="true" && $8=="true"){printf "::error::Validation discrepancy: %s/%s (%s)\n",$1,$2,$9}' "$summary_csv"
+  awk -F',' 'NR>1 && !($7=="true" && $8=="true" && $9=="true"){printf "::error::Validation discrepancy: %s/%s (%s)\n",$1,$2,$10}' "$summary_csv"
 else
   echo "::warning::Validation completed with discrepancies: ${passed} matched, ${failed} with issues (of ${total_validated})"
-  awk -F',' 'NR>1 && !($7=="true" && $8=="true"){printf "::warning::Validation discrepancy: %s/%s (%s)\n",$1,$2,$9}' "$summary_csv"
+  awk -F',' 'NR>1 && !($7=="true" && $8=="true" && $9=="true"){printf "::warning::Validation discrepancy: %s/%s (%s)\n",$1,$2,$10}' "$summary_csv"
 fi
 
 if [[ "$FAIL_ON_VALIDATION_FAILURES" == "true" && "$failed" -gt 0 ]]; then
