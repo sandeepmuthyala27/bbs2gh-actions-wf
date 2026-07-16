@@ -89,11 +89,60 @@ else
   OUTPUT_CSV_PATH="${OUTPUT_PATH}"
 fi
 
+if ! command -v gh >/dev/null 2>&1; then
+  echo -e "\033[31m[ERROR] GitHub CLI (gh) is not installed. See https://cli.github.com/\033[0m"
+  exit 1
+fi
+logv "gh version: $(gh --version | head -n 1)"
+if ! gh bbs2gh --version >/dev/null 2>&1; then
+  echo -e "\033[31m[ERROR] Required gh extension 'gh-bbs2gh' is not installed. Install with: gh extension install github/gh-bbs2gh\033[0m"
+  exit 1
+fi
+logv "gh bbs2gh version: $(gh bbs2gh --version 2>/dev/null | head -n 1)"
+
 # gh auth
 if ! gh auth status >/dev/null 2>&1; then
   echo -e "\033[31m[ERROR] GitHub CLI not authenticated. Run: gh auth login (or set GH_TOKEN/GH_PAT).\033[0m"
   exit 1
 fi
+
+detect_bbs_install() {
+  local p launcher userPath bbsHome
+  if [[ -n "${BITBUCKET_HOME:-}" && -d "${BITBUCKET_HOME}" ]]; then
+    export BITBUCKET_HOME
+    echo -e "\033[32m[OK] Bitbucket Server home found via BITBUCKET_HOME: ${BITBUCKET_HOME}\033[0m"
+    return 0
+  fi
+  for p in /var/atlassian/application-data/bitbucket /opt/atlassian/bitbucket; do
+    if [[ -d "$p" ]]; then
+      export BITBUCKET_HOME="$p"
+      echo -e "\033[32m[OK] Bitbucket Server found at default location: ${p}\033[0m"
+      return 0
+    fi
+  done
+  launcher="$(command -v start-bitbucket.sh 2>/dev/null || command -v bitbucket 2>/dev/null || true)"
+  if [[ -n "$launcher" ]]; then
+    bbsHome="$(cd "$(dirname "$launcher")/.." 2>/dev/null && pwd || dirname "$launcher")"
+    export BITBUCKET_HOME="$bbsHome"
+    echo -e "\033[32m[OK] Bitbucket Server launcher found on PATH: ${launcher} (home: ${bbsHome})\033[0m"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    read -r -p "Bitbucket Server install not found (checked BITBUCKET_HOME, /var/atlassian/application-data/bitbucket, /opt/atlassian/bitbucket, PATH). Enter its path (blank to skip): " userPath || true
+    if [[ -n "${userPath:-}" && -d "${userPath}" ]]; then
+      export BITBUCKET_HOME="${userPath}"
+      echo -e "\033[32m[OK] Using Bitbucket Server path: ${userPath}\033[0m"
+    elif [[ -n "${userPath:-}" ]]; then
+      echo -e "\033[33m[WARNING] Path does not exist: ${userPath}. Continuing without a local Bitbucket Server path.\033[0m"
+    else
+      echo -e "\033[33m[WARNING] No path provided. Continuing without a local Bitbucket Server path.\033[0m"
+    fi
+  else
+    echo -e "\033[33m[WARNING] Bitbucket Server install not found locally. Continuing (remote/SSH migration does not require a local install).\033[0m"
+  fi
+  return 0
+}
+detect_bbs_install
 
 # BBS env validation
 if [[ -z "${BBS_BASE_URL:-}" || -z "${BBS_USERNAME:-}" || -z "${BBS_PASSWORD:-}" ]]; then
@@ -166,6 +215,14 @@ choose_storage_backend() {
 }
 
 choose_storage_backend
+
+BBS_TLS_ARGS=()
+case "${BBS_DISABLE_SSL_VERIFY:-}" in
+  [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1)
+    BBS_TLS_ARGS+=(--no-ssl-verify)
+    echo -e "\033[33m[WARNING] TLS certificate verification is DISABLED (BBS_DISABLE_SSL_VERIFY set). gh bbs2gh will run with --no-ssl-verify.\033[0m"
+    ;;
+esac
 
 ############################################
 # CSV helpers (robust parsing)
@@ -338,11 +395,11 @@ migrate_repository() {
       --github-org "${github_org}" \
       --github-repo "${github_repo}" \
       "${STORAGE_ARGS[@]}" \
+      ${BBS_TLS_ARGS[@]+"${BBS_TLS_ARGS[@]}"} \
       --ssh-user "${SSH_USER}" \
       --ssh-private-key "${resolvedKey}" \
       --target-api-url "${TARGET_API_URL}" \
-      --target-repo-visibility "${gh_repo_visibility}" \
-      --no-ssl-verify \
+      --target-repo-visibility "${gh_repo_visibility}"
 
     # Assess log content
     if grep -q "No operation will be performed" "${log_file}"; then
@@ -522,17 +579,17 @@ echo "[INFO] Wrote migration results with Migration_Status column: ${OUTPUT_CSV_
 ############################################
 # 3-way exit code + GitHub Actions annotations
 ############################################
-if (( ${#FAILED[@]} == 0 )); then
-  echo "::notice::All ${total_repos} repositories migrated successfully"
-  exit 0
-
-elif (( ${#MIGRATED[@]} == 0 )); then
-  echo "::error::All ${total_repos} repositories failed to migrate"
+if (( ${#MIGRATED[@]} == 0 )); then
+  echo "::error::No repositories were migrated successfully (0 succeeded out of ${total_repos})."
   for item in "${FAILED[@]}"; do
     IFS=$'\t' read -r pk _pn rs gh_org gh_repo _vis <<< "${item}"
     echo "::error::Failed: ${gh_org}/${gh_repo} (${pk}/${rs})"
   done
   exit 1
+
+elif (( ${#FAILED[@]} == 0 )); then
+  echo "::notice::All ${total_repos} repositories migrated successfully"
+  exit 0
 
 else
   echo "::warning::Migration completed with partial success: ${#MIGRATED[@]} succeeded, ${#FAILED[@]} failed out of ${total_repos} total"
