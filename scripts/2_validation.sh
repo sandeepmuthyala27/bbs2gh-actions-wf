@@ -80,7 +80,32 @@ auth_header() {
   fi
 }
 
-curl_json() { curl -sS -H "$(auth_header)" "$1"; }
+DISABLE_SSL_VERIFY=false
+case "${BBS_DISABLE_SSL_VERIFY:-}" in
+  [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) DISABLE_SSL_VERIFY=true ;;
+esac
+CURL_OPTS=(-sS)
+$DISABLE_SSL_VERIFY && CURL_OPTS+=(--insecure)
+
+curl_json() { curl "${CURL_OPTS[@]}" -H "$(auth_header)" "$1"; }
+
+check_tls() {
+  if $DISABLE_SSL_VERIFY; then
+    log_warning "TLS certificate verification is DISABLED (BBS_DISABLE_SSL_VERIFY set). Proceeding without cert validation."
+    return 0
+  fi
+  local probe rc
+  probe="$(curl -sS -o /dev/null "${BASE_URL}/rest/api/1.0/projects?limit=1" 2>&1)"; rc=$?
+  case "$rc" in
+    35|51|58|59|60|66|77|83|91)
+      log_error "TLS/SSL certificate validation failed for ${BASE_URL} (curl exit ${rc}): ${probe}"
+      log_error "If this host uses a self-signed or internal CA certificate intentionally, re-run with BBS_DISABLE_SSL_VERIFY=Y."
+      exit 1
+      ;;
+  esac
+  return 0
+}
+check_tls
 
 # ---- Bitbucket helpers --------------------------------------------------------
 # Returns tab-separated lines: branchName<TAB>sha  (paginated, limit 500 per page)
@@ -241,20 +266,19 @@ validate_repo() {
       fi
 
       local -a branches_to_check=()
+      local name
+      [[ -n "$validation_branch" ]] && branches_to_check+=("$validation_branch")
+      for name in "${!ghSHAmap[@]}"; do
+        (( ${#branches_to_check[@]} >= 10 )) && break
+        [[ "$name" == "$validation_branch" ]] && continue
+        branches_to_check+=("$name")
+      done
       if (( bbsBranchCount > 10 || ghBranchCount > 10 )); then
-        [[ -n "$validation_branch" ]] && branches_to_check+=("$validation_branch")
-        local name
-        for name in "${!ghSHAmap[@]}"; do
-          [[ "$name" == "$validation_branch" ]] && continue
-          branches_to_check+=("$name")
-          (( ${#branches_to_check[@]} >= 10 )) && break
-        done
-        echo "[$(date)] Repo has >10 branches. SHA check limited to first ${#branches_to_check[@]} branches (default branch first)."
-      elif [[ -n "$validation_branch" ]]; then
-        branches_to_check+=("$validation_branch")
-        echo "[$(date)] Repo has <=10 branches. SHA check limited to default branch: '${validation_branch}'."
+        echo "[$(date)] Repo has >10 branches. SHA check limited to ${#branches_to_check[@]} branch(es) (default branch first, max 10)."
+      elif (( ${#branches_to_check[@]} > 0 )); then
+        echo "[$(date)] SHA check covers ${#branches_to_check[@]} branch(es) (default branch first, max 10)."
       else
-        echo "[$(date)] Could not determine a default branch for SHA check."
+        echo "[$(date)] Could not determine any branch for SHA check."
       fi
 
       if (( ${#branches_to_check[@]} > 0 )); then
