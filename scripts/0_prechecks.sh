@@ -33,11 +33,21 @@ log_warning() { echo -e "${C_YELLOW}[WARNING]${C_NC} $1" | tee -a "$LOG_FILE"; }
 log_error()   { echo -e "${C_RED}[ERROR]${C_NC} $1"      | tee -a "$LOG_FILE" >&2; }
 
 detect_bbs_install() {
-  local p launcher userPath bbsHome
+  local p launcher bbsHome line detected
   if [[ -n "${BITBUCKET_HOME:-}" && -d "${BITBUCKET_HOME}" ]]; then
     export BITBUCKET_HOME
     log_success "Bitbucket Server home found via BITBUCKET_HOME: ${BITBUCKET_HOME}"
     return 0
+  fi
+  line="$(ps -ef 2>/dev/null | grep -i '[b]itbucket' | grep -i 'home' | head -n1 || true)"
+  if [[ -n "$line" ]]; then
+    detected="$(printf '%s\n' "$line" | grep -oE 'bitbucket[._]home=[^[:space:]]+' | head -n1 | sed -E 's/^.*home=//' || true)"
+    [[ -z "$detected" ]] && detected="$(printf '%s\n' "$line" | grep -oE '/[^[:space:]]+/bitbucket[^[:space:]]*' | head -n1 || true)"
+    if [[ -n "$detected" ]]; then
+      export BITBUCKET_HOME="$detected"
+      log_success "Bitbucket Server home auto-detected from running process: ${detected}"
+      return 0
+    fi
   fi
   for p in /var/atlassian/application-data/bitbucket /opt/atlassian/bitbucket; do
     if [[ -d "$p" ]]; then
@@ -53,22 +63,10 @@ detect_bbs_install() {
     log_success "Bitbucket Server launcher found on PATH: ${launcher} (home: ${bbsHome})"
     return 0
   fi
-  if [[ -t 0 ]]; then
-    read -r -p "Bitbucket Server install not found (checked BITBUCKET_HOME, /var/atlassian/application-data/bitbucket, /opt/atlassian/bitbucket, PATH). Enter its path (blank to skip): " userPath || true
-    if [[ -n "${userPath:-}" && -d "${userPath}" ]]; then
-      export BITBUCKET_HOME="${userPath}"
-      log_success "Using Bitbucket Server path: ${userPath}"
-    elif [[ -n "${userPath:-}" ]]; then
-      log_warning "Path does not exist: ${userPath}. Continuing without a local Bitbucket Server path."
-    else
-      log_warning "No path provided. Continuing without a local Bitbucket Server path."
-    fi
-  else
-    log_warning "Bitbucket Server install not found locally. Continuing (remote/SSH migration does not require a local install)."
-  fi
+  log_warning "Bitbucket Server install not found locally (checked BITBUCKET_HOME, running process, default dirs, PATH). Continuing — remote/SSH migration does not require a local install."
   return 0
 }
-detect_bbs_install
+detect_bbs_install || true
 
 auth_header() {
   if [[ -n "${BBS_PAT:-}" ]]; then
