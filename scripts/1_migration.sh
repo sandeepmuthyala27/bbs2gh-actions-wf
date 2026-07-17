@@ -67,8 +67,8 @@ logv() { if [[ "$VERBOSE" == "1" ]]; then echo -e "[DEBUG] $*"; fi; }
 if [[ -z "${MAX_CONCURRENT}" || ! "${MAX_CONCURRENT}" =~ ^[0-9]+$ ]]; then
   echo -e "\033[31m[ERROR] --max-concurrent must be an integer\033[0m"; exit 1
 fi
-if [[ "${MAX_CONCURRENT}" -gt 20 ]]; then
-  echo -e "\033[31m[ERROR] Maximum concurrent migrations (${MAX_CONCURRENT}) exceeds the allowed limit of 20.\033[0m"
+if [[ "${MAX_CONCURRENT}" -gt 5 ]]; then
+  echo -e "\033[31m[ERROR] Maximum concurrent migrations (${MAX_CONCURRENT}) exceeds the allowed limit of 5.\033[0m"
   exit 1
 fi
 if [[ "${MAX_CONCURRENT}" -lt 1 ]]; then
@@ -107,11 +107,21 @@ if ! gh auth status >/dev/null 2>&1; then
 fi
 
 detect_bbs_install() {
-  local p launcher userPath bbsHome
+  local p launcher bbsHome line detected
   if [[ -n "${BITBUCKET_HOME:-}" && -d "${BITBUCKET_HOME}" ]]; then
     export BITBUCKET_HOME
     echo -e "\033[32m[OK] Bitbucket Server home found via BITBUCKET_HOME: ${BITBUCKET_HOME}\033[0m"
     return 0
+  fi
+  line="$(ps -ef 2>/dev/null | grep -i '[b]itbucket' | grep -i 'home' | head -n1 || true)"
+  if [[ -n "$line" ]]; then
+    detected="$(printf '%s\n' "$line" | grep -oE 'bitbucket[._]home=[^[:space:]]+' | head -n1 | sed -E 's/^.*home=//' || true)"
+    [[ -z "$detected" ]] && detected="$(printf '%s\n' "$line" | grep -oE '/[^[:space:]]+/bitbucket[^[:space:]]*' | head -n1 || true)"
+    if [[ -n "$detected" ]]; then
+      export BITBUCKET_HOME="$detected"
+      echo -e "\033[32m[OK] Bitbucket Server home auto-detected from running process: ${detected}\033[0m"
+      return 0
+    fi
   fi
   for p in /var/atlassian/application-data/bitbucket /opt/atlassian/bitbucket; do
     if [[ -d "$p" ]]; then
@@ -127,22 +137,10 @@ detect_bbs_install() {
     echo -e "\033[32m[OK] Bitbucket Server launcher found on PATH: ${launcher} (home: ${bbsHome})\033[0m"
     return 0
   fi
-  if [[ -t 0 ]]; then
-    read -r -p "Bitbucket Server install not found (checked BITBUCKET_HOME, /var/atlassian/application-data/bitbucket, /opt/atlassian/bitbucket, PATH). Enter its path (blank to skip): " userPath || true
-    if [[ -n "${userPath:-}" && -d "${userPath}" ]]; then
-      export BITBUCKET_HOME="${userPath}"
-      echo -e "\033[32m[OK] Using Bitbucket Server path: ${userPath}\033[0m"
-    elif [[ -n "${userPath:-}" ]]; then
-      echo -e "\033[33m[WARNING] Path does not exist: ${userPath}. Continuing without a local Bitbucket Server path.\033[0m"
-    else
-      echo -e "\033[33m[WARNING] No path provided. Continuing without a local Bitbucket Server path.\033[0m"
-    fi
-  else
-    echo -e "\033[33m[WARNING] Bitbucket Server install not found locally. Continuing (remote/SSH migration does not require a local install).\033[0m"
-  fi
+  echo -e "\033[33m[WARNING] Bitbucket Server install not found locally (checked BITBUCKET_HOME, running process, default dirs, PATH). Continuing — remote/SSH migration does not require a local install.\033[0m"
   return 0
 }
-detect_bbs_install
+detect_bbs_install || true
 
 # BBS env validation
 if [[ -z "${BBS_BASE_URL:-}" || -z "${BBS_USERNAME:-}" || -z "${BBS_PASSWORD:-}" ]]; then
