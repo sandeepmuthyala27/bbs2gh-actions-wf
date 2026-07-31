@@ -38,7 +38,7 @@ VERBOSE="${VERBOSE:-0}"
 ############################################
 # CLI args
 ############################################
-MAX_CONCURRENT=3
+MAX_CONCURRENT=10
 CSV_PATH="repos.csv"
 OUTPUT_PATH="" # empty -> timestamped file
 
@@ -55,7 +55,7 @@ while [[ $# -gt 0 ]]; do
     --target-api-url|--github-api-url) TARGET_API_URL="$2"; shift 2;;
 
     -*|--*) echo -e "\033[31m[ERROR] Unknown option: $1\033[0m"; exit 1;;
-    *) echo -e "\033[31m[ERROR] Unexpected positional arg: $1\033[0m"; exit 1;;
+    *) echhttps://github.com/customer-success-microsoft/csu-ado-github-mf/pull/485/conflict?name=bbs-to-github%252Fprivate%252Fautomated-migration-dr-and-non-dr%252Fscripts%252F1_migration.sh&ancestor_oid=f1fb2ee399126573cd3a64235c1b4c7be1a371a6&base_oid=ea1da1860d1da77cda74deb68a4cab042679c23f&head_oid=b5cacb9c43a2819477410b9b6952997adebfb536o -e "\033[31m[ERROR] Unexpected positional arg: $1\033[0m"; exit 1;;
   esac
 done
 
@@ -67,8 +67,8 @@ logv() { if [[ "$VERBOSE" == "1" ]]; then echo -e "[DEBUG] $*"; fi; }
 if [[ -z "${MAX_CONCURRENT}" || ! "${MAX_CONCURRENT}" =~ ^[0-9]+$ ]]; then
   echo -e "\033[31m[ERROR] --max-concurrent must be an integer\033[0m"; exit 1
 fi
-if [[ "${MAX_CONCURRENT}" -gt 5 ]]; then
-  echo -e "\033[31m[ERROR] Maximum concurrent migrations (${MAX_CONCURRENT}) exceeds the allowed limit of 5.\033[0m"
+if [[ "${MAX_CONCURRENT}" -gt 10 ]]; then
+  echo -e "\033[31m[ERROR] Maximum concurrent migrations (${MAX_CONCURRENT}) exceeds the allowed limit of 10.\033[0m"
   exit 1
 fi
 if [[ "${MAX_CONCURRENT}" -lt 1 ]]; then
@@ -338,8 +338,6 @@ resolve_key_path() {
     local tmp; tmp="$(mktemp --suffix=.pem)"
     chmod 600 "$tmp"
     printf "%s" "$input" > "$tmp"
-    # Register cleanup so the temp key file is removed when the subshell exits
-    trap 'rm -f "${tmp}"' EXIT
     echo "$tmp"
   elif [[ -z "$input" && -n "${SSH_PRIVATE_KEY_PATH:-}" ]]; then
     echo "$SSH_PRIVATE_KEY_PATH"
@@ -370,6 +368,9 @@ migrate_repository() {
       "$(date)" "${projectKey}" "${bbsRepoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}"
 
     local resolvedKey; resolvedKey="$(resolve_key_path "${SSH_PRIVATE_KEY:-${SSH_PRIVATE_KEY_PATH:-}}")"
+    if [[ -n "${SSH_PRIVATE_KEY:-}" ]]; then
+      trap 'rm -f "${resolvedKey}"' RETURN
+    fi
     if [[ -z "$resolvedKey" || ! -f "$resolvedKey" ]]; then
       printf '[%s] [ERROR] SSH private key path is invalid or missing: %s\n' "$(date)" "${resolvedKey:-<empty>}"
       return 1
@@ -426,6 +427,52 @@ declare -A JOB_LASTLEN=()  # pid -> last printed length
 QUEUE=()
 MIGRATED=()
 FAILED=()
+SKIPPED_LARGE=()
+
+############################################
+# Large-file skip list (from prechecks)
+############################################
+MIGRATE_LARGE_FILE_REPOS_FLAG=false
+case "${MIGRATE_LARGE_FILE_REPOS:-}" in
+  [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) MIGRATE_LARGE_FILE_REPOS_FLAG=true ;;
+esac
+
+declare -A LARGE_FILE_SKIP=()
+LARGE_FILE_SKIP_TOTAL=0
+
+load_large_file_skip_list() {
+  if [[ "${MIGRATE_LARGE_FILE_REPOS_FLAG}" == true ]]; then
+    echo -e "\033[33m[WARNING] MIGRATE_LARGE_FILE_REPOS is enabled - repos containing large files will be migrated. Ensure Git LFS is configured or migration may fail.\033[0m"
+    return 0
+  fi
+  local f="${LARGE_FILE_REPOS_CSV:-}"
+  if [[ -z "$f" ]]; then
+    f="$(ls -1t large_file_repos-*.csv 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -z "$f" ]]; then
+    local d; d="$(dirname "${CSV_PATH}")"
+    f="$(ls -1t "${d}"/large_file_repos-*.csv 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -z "$f" || ! -f "$f" ]]; then
+    logv "No large-file skip-list found; every repo in the CSV will be attempted."
+    return 0
+  fi
+  local pk rs _rest key
+  while IFS=',' read -r pk rs _rest; do
+    pk="$(strip_quotes "${pk:-}")"; rs="$(strip_quotes "${rs:-}")"
+    [[ -z "$pk" || -z "$rs" || "$pk" == "project_key" ]] && continue
+    key="${pk}/${rs}"
+    if [[ -z "${LARGE_FILE_SKIP[$key]:-}" ]]; then
+      LARGE_FILE_SKIP[$key]=1
+      LARGE_FILE_SKIP_TOTAL=$(( LARGE_FILE_SKIP_TOTAL + 1 ))
+    fi
+  done < "$f"
+  if (( LARGE_FILE_SKIP_TOTAL > 0 )); then
+    echo -e "\033[33m[WARNING] Large-file skip-list loaded from ${f}: ${LARGE_FILE_SKIP_TOTAL} repo(s) will be skipped. Set MIGRATE_LARGE_FILE_REPOS=true to migrate them anyway.\033[0m"
+  fi
+  return 0
+}
+load_large_file_skip_list
 
 ############################################
 # Load queue from CSV rows (skip header)
@@ -458,6 +505,12 @@ while IFS= read -r line; do
     continue
   fi
 
+  if [[ -n "${LARGE_FILE_SKIP["${projectKey}/${repoSlug}"]:-}" ]]; then
+    echo "[WARNING] Skipping ${projectKey}/${repoSlug} -> ${github_org}/${github_repo}: contains large file(s) flagged by prechecks."
+    SKIPPED_LARGE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
+    continue
+  fi
+
   QUEUE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
 done < "${CSV_PATH}"
 
@@ -465,13 +518,20 @@ done < "${CSV_PATH}"
 # Initialize output CSV with Pending
 ############################################
 write_migration_status_csv_header
-for item in "${QUEUE[@]}"; do
+for item in ${QUEUE[@]+"${QUEUE[@]}"}; do
   IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${item}"
   append_status_row "${projectKey}" "${projectName}" "${repoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}" "Pending" ""
+done
+for item in ${SKIPPED_LARGE[@]+"${SKIPPED_LARGE[@]}"}; do
+  IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${item}"
+  append_status_row "${projectKey}" "${projectName}" "${repoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}" "Skipped - Large Files" ""
 done
 
 echo "[INFO] Starting migration with ${MAX_CONCURRENT} concurrent jobs..."
 echo "[INFO] Processing ${#QUEUE[@]} repositories from: ${CSV_PATH}"
+if (( ${#SKIPPED_LARGE[@]} > 0 )); then
+  echo "[INFO] Skipping ${#SKIPPED_LARGE[@]} repositories flagged with large files (deferred for Git LFS migration)."
+fi
 echo "[INFO] Initialized migration status output: ${OUTPUT_CSV_PATH}"
 
 ############################################
@@ -571,26 +631,38 @@ done
 echo
 echo "[INFO] All migrations completed."
 total_repos=$(( $(wc -l < "${CSV_PATH}") - 1 ))
-echo "[SUMMARY] Total: ${total_repos} / Migrated: ${#MIGRATED[@]} / Failed: ${#FAILED[@]}"
+echo "[SUMMARY] Total: ${total_repos} / Migrated: ${#MIGRATED[@]} / Failed: ${#FAILED[@]} / Skipped (large files): ${#SKIPPED_LARGE[@]}"
 echo "[INFO] Wrote migration results with Migration_Status column: ${OUTPUT_CSV_PATH}"
+
+if (( ${#SKIPPED_LARGE[@]} > 0 )); then
+  echo "::warning::${#SKIPPED_LARGE[@]} repository(ies) were skipped because they contain large files. Convert them to Git LFS and re-run with MIGRATE_LARGE_FILE_REPOS=true."
+  for item in "${SKIPPED_LARGE[@]}"; do
+    IFS=$'\t' read -r pk _pn rs gh_org gh_repo _vis <<< "${item}"
+    echo "::warning::Skipped (large files): ${gh_org}/${gh_repo} (${pk}/${rs})"
+  done
+fi
 
 ############################################
 # 3-way exit code + GitHub Actions annotations
 ############################################
-if (( ${#MIGRATED[@]} == 0 )); then
+if (( ${#MIGRATED[@]} == 0 && ${#FAILED[@]} == 0 && ${#SKIPPED_LARGE[@]} > 0 )); then
+  echo "::notice::No migrations were attempted - all ${#SKIPPED_LARGE[@]} repository(ies) were deliberately skipped due to large files."
+  exit 0
+
+elif (( ${#MIGRATED[@]} == 0 )); then
   echo "::error::No repositories were migrated successfully (0 succeeded out of ${total_repos})."
-  for item in "${FAILED[@]}"; do
+  for item in ${FAILED[@]+"${FAILED[@]}"}; do
     IFS=$'\t' read -r pk _pn rs gh_org gh_repo _vis <<< "${item}"
     echo "::error::Failed: ${gh_org}/${gh_repo} (${pk}/${rs})"
   done
   exit 1
 
 elif (( ${#FAILED[@]} == 0 )); then
-  echo "::notice::All ${total_repos} repositories migrated successfully"
+  echo "::notice::All ${#MIGRATED[@]} attempted repositories migrated successfully (${#SKIPPED_LARGE[@]} skipped, ${total_repos} in CSV)"
   exit 0
 
 else
-  echo "::warning::Migration completed with partial success: ${#MIGRATED[@]} succeeded, ${#FAILED[@]} failed out of ${total_repos} total"
+  echo "::warning::Migration completed with partial success: ${#MIGRATED[@]} succeeded, ${#FAILED[@]} failed, ${#SKIPPED_LARGE[@]} skipped out of ${total_repos} total"
   for item in "${FAILED[@]}"; do
     IFS=$'\t' read -r pk _pn rs gh_org gh_repo _vis <<< "${item}"
     echo "::warning::Failed: ${gh_org}/${gh_repo} (${pk}/${rs})"
