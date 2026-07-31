@@ -9,11 +9,16 @@ on:
         default: 'bbs-migration'
         type: string
       max_concurrent:
-        description: "Maximum concurrent migrations (1-5; the tool supports up to 5)"
+        description: Maximum concurrent migrations (1-10)
         required: false
         default: '5'
         type: choice
-        options: ['1', '2', '3', '4', '5']
+        options: ['1','2','3','4','5','6','7','8','9','10']
+      target_api_url:
+        description: "GitHub data residency API base URL. (https://api.<tenant>.ghe.com)"
+        required: false
+        default: ''
+        type: string
       verbose:
         description: Enable verbose logging (sets VERBOSE=1 and uploads *.log artifacts if produced)
         required: false
@@ -48,6 +53,12 @@ on:
         default: 'true'
         type: choice
         options: ['true', 'false']
+      migrate_large_file_repos:
+        description: "Migrate repos containing large files (>= LARGE_FILE_THRESHOLD_MB, default 400MB). 'false' skips them and reports them for a later Git LFS migration."
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 permissions:
   contents: read
@@ -135,11 +146,12 @@ jobs:
               echo
               echo "**Repo Details**"
               echo
-              echo "| Project Key | Repo | Open PRs | Ready |"
-              echo "|-|-|-|-|"
+              echo "| Project Key | Repo | Open PRs | Large Files | Ready |"
+              echo "|-|-|-|-|-|"
               awk -F',' 'NR>1 {
                 mark=($7=="true" ? "✅" : "⚠️");
-                printf("| `%s` | `%s` | %s | %s |\n", $1, $3, $5, mark);
+                lf=($8=="true" ? "⏭️ yes" : "no");
+                printf("| `%s` | `%s` | %s | %s | %s |\n", $1, $3, $5, lf, mark);
               }' "$out_csv"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -161,7 +173,7 @@ jobs:
               if [[ "$rows" -eq 0 ]]; then
                 echo "✅ No files ≥ ${thr}MB found."
               else
-                echo "⚠️ Found **$rows** file(s) ≥ ${thr}MB. Migrate these repos with Git LFS to avoid failures."
+                echo "⚠️ Found **$rows** file(s) ≥ ${thr}MB. These repos are **excluded from migration** unless the workflow is re-run with \`migrate_large_file_repos = true\`. Convert them to Git LFS first."
                 echo
                 echo "| Project Key | Repo | File | Size (MB) |"
                 echo "|-|-|-|-|"
@@ -178,6 +190,7 @@ jobs:
           path: |
             bbs_pr_validation_output-*.csv
             large_files_report-*.csv
+            large_file_repos-*.csv
           retention-days: 30
           if-no-files-found: warn
 
@@ -287,6 +300,34 @@ jobs:
           set -euo pipefail
           mkdir -p "${{ runner.temp }}/bbs2gh-run"
 
+      - name: Download prechecks output (large-file skip-list)
+        if: ${{ inputs.migrate_large_file_repos == 'false' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: bbs-prechecks-${{ github.run_id }}
+          path: ${{ runner.temp }}/bbs2gh-run
+
+      - name: Resolve large-file skip-list
+        shell: bash
+        working-directory: ${{ runner.temp }}/bbs2gh-run
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.migrate_large_file_repos }}" == "true" ]]; then
+            echo "::warning::migrate_large_file_repos=true - repos with large files WILL be migrated. Ensure Git LFS is configured or these migrations may fail."
+            echo "LARGE_FILE_REPOS_CSV=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          skip_csv=$(ls -1t large_file_repos-*.csv 2>/dev/null | head -n 1 || true)
+          if [[ -z "$skip_csv" || ! -f "$skip_csv" ]]; then
+            echo "::notice::No large-file skip-list found (prechecks skipped, scan disabled, or no large files). All repos in the CSV will be attempted."
+            echo "LARGE_FILE_REPOS_CSV=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          count=$(awk -F',' 'NR>1 && NF>=2 {c++} END{print c+0}' "$skip_csv")
+          echo "::notice::Large-file skip-list: $count repo(s) will be skipped ($skip_csv)."
+          echo "LARGE_FILE_REPOS_CSV=${{ runner.temp }}/bbs2gh-run/${skip_csv}" >> "$GITHUB_ENV"
+
       # Use a clean GH_CONFIG_DIR so `gh auth status` inside 1_migration.sh resolves correctly for Data Residency endpoints.
       - name: Prepare clean gh auth for migration
         shell: bash
@@ -322,6 +363,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_BUCKET_NAME: ${{ secrets.AWS_BUCKET_NAME }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
+          MIGRATE_LARGE_FILE_REPOS: ${{ inputs.migrate_large_file_repos }}
+          LARGE_FILE_REPOS_CSV: ${{ env.LARGE_FILE_REPOS_CSV }}
         run: |
           set -euo pipefail
           export GH_CONFIG_DIR="$RUNNER_TEMP/gh-dr"
@@ -368,10 +411,12 @@ jobs:
               total=$(awk -F',' 'NR>1 {c++} END{print c+0}' "$out_csv")
               succeeded=$(awk -F',' 'NR>1 {gsub(/"/, "", $7); if ($7=="Success") c++} END{print c+0}' "$out_csv")
               failed=$(awk -F',' 'NR>1 {gsub(/"/, "", $7); if ($7=="Failure") c++} END{print c+0}' "$out_csv")
+              skipped=$(awk -F',' 'NR>1 {gsub(/"/, "", $7); if ($7=="Skipped - Large Files") c++} END{print c+0}' "$out_csv")
 
               echo "- **Total repos**: $total"
               echo "- **Migrated**: ✅ $succeeded"
               echo "- **Failed**: $( [[ "$failed" -gt 0 ]] && echo "❌ $failed" || echo "0" )"
+              echo "- **Skipped (large files)**: $( [[ "$skipped" -gt 0 ]] && echo "⏭️ $skipped" || echo "0" )"
               echo
               echo "**Repo-wise Results**"
               echo
@@ -379,10 +424,24 @@ jobs:
               echo "|-|-|-|-|-|-|"
               awk -F',' 'NR>1 {
                 for(i=1;i<=NF;i++) gsub(/"/,"",$i);
-                mark=($7=="Success"?"✅":"❌");
+                mark=($7=="Success"?"✅":($7=="Skipped - Large Files"?"⏭️":"❌"));
                 printf("| `%s` | `%s` | `%s` | `%s` | %s %s | `%s` |\n",
                   $1, $3, $4, $5, mark, $7, $8);
               }' "$out_csv"
+
+              if [[ "$skipped" -gt 0 ]]; then
+                echo
+                echo "**⏭️ Deferred for Git LFS migration**"
+                echo
+                echo "These repos contain files ≥ the large-file threshold and were skipped. Convert them to Git LFS, then re-run this workflow with **migrate_large_file_repos = true**."
+                echo
+                echo "| Project Key | BBS Repo | GitHub Org | GitHub Repo |"
+                echo "|-|-|-|-|"
+                awk -F',' 'NR>1 {
+                  for(i=1;i<=NF;i++) gsub(/"/,"",$i);
+                  if ($7=="Skipped - Large Files") printf("| `%s` | `%s` | `%s` | `%s` |\n", $1, $3, $4, $5);
+                }' "$out_csv"
+              fi
             fi
           } > "$GITHUB_STEP_SUMMARY"
 
@@ -481,7 +540,7 @@ jobs:
         if: steps.filter-csv.outputs.count == '0'
         shell: bash
         run: |
-          echo "::notice::All migrations failed — skipping validation."
+          echo "::notice::No repositories migrated successfully (failed and/or skipped) — skipping validation."
           echo "ℹ️ No repositories were successfully migrated — validation skipped." >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
