@@ -91,6 +91,10 @@ curl_json() {
   curl "${CURL_OPTS[@]}" -H "$(auth_header)" "$1"
 }
 
+urlencode() {
+  jq -rn --arg v "$1" '$v|@uri'
+}
+
 check_tls() {
   if $DISABLE_SSL_VERIFY; then
     log_warning "TLS certificate verification is DISABLED (BBS_DISABLE_SSL_VERIFY set). Proceeding without cert validation."
@@ -133,12 +137,20 @@ trap 'rm -f "${rows_tmp:-}" "${ready_tmp:-}" "${results_tmp:-}"' EXIT
 get_open_pr_count() {
   local projectKey="$1" repoSlug="$2"
   # Use limit=1 and read the top-level .size — a single call gives the full count
-  local resp
-  resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${repoSlug}/pull-requests?state=OPEN&limit=1")" || { echo "ERROR"; return; }
+  local resp encProjectKey encRepoSlug
+  encProjectKey="$(urlencode "$projectKey")"
+  encRepoSlug="$(urlencode "$repoSlug")"
+  resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProjectKey}/repos/${encRepoSlug}/pull-requests?state=OPEN&limit=1")" || { echo "ERROR"; return; }
   echo "$resp" | jq -r '.size // 0' 2>/dev/null || echo "ERROR"
 }
 
 LARGE_FILE_REPORT="large_files_report-${timestamp}.csv"
+LARGE_FILE_REPOS_CSV="large_file_repos-${timestamp}.csv"
+LARGE_FILE_THRESHOLD_MB_EFFECTIVE="${LARGE_FILE_THRESHOLD_MB:-400}"
+declare -A LARGE_FILE_REPO_SET=()
+declare -A LARGE_FILE_REPO_COUNT=()
+declare -A LARGE_FILE_REPO_MAXMB=()
+LARGE_FILE_REPO_TOTAL=0
 scan_large_files() {
   case "${RUN_LARGE_FILE_SCAN:-Y}" in
     [Nn]|[Nn][Oo]|0|[Ff][Aa][Ll][Ss][Ee]) log_info "Large-file scan disabled (RUN_LARGE_FILE_SCAN)."; return 0 ;;
@@ -159,18 +171,30 @@ scan_large_files() {
     [[ -z "${projKey:-}" || -z "${repoSlug:-}" ]] && continue
     scanned=$(( scanned + 1 ))
     local mir="${tmpdir}/${projKey}_${repoSlug}.git"
+    local encProjKey encRepoSlug; encProjKey="$(urlencode "$projKey")"; encRepoSlug="$(urlencode "$repoSlug")"
     if ! git "${git_ssl[@]}" -c http.extraHeader="$hdr" clone --mirror --quiet \
-         "${BASE_URL}/scm/${projKey}/${repoSlug}.git" "$mir" 2>/dev/null; then
+         "${BASE_URL}/scm/${encProjKey}/${encRepoSlug}.git" "$mir" 2>/dev/null; then
       log_warning "Could not clone ${projKey}/${repoSlug} for large-file scan (skipping)."
       continue
     fi
-    local bsize bpath mb
+    local bsize bpath mb rkey
+    rkey="${projKey}/${repoSlug}"
     while IFS=$'\t' read -r bsize bpath; do
       [[ -z "${bsize:-}" ]] && continue
       mb=$(( bsize / 1024 / 1024 ))
       printf '%s,%s,"%s",%s,%s\n' "$projKey" "$repoSlug" "$bpath" "$bsize" "$mb" >> "$LARGE_FILE_REPORT"
       log_warning "Large file in ${projKey}/${repoSlug}: ${bpath} (${mb} MB)"
       flagged=$(( flagged + 1 ))
+      if [[ -z "${LARGE_FILE_REPO_SET[$rkey]:-}" ]]; then
+        LARGE_FILE_REPO_SET[$rkey]=1
+        LARGE_FILE_REPO_COUNT[$rkey]=0
+        LARGE_FILE_REPO_MAXMB[$rkey]=0
+        LARGE_FILE_REPO_TOTAL=$(( LARGE_FILE_REPO_TOTAL + 1 ))
+      fi
+      LARGE_FILE_REPO_COUNT[$rkey]=$(( ${LARGE_FILE_REPO_COUNT[$rkey]} + 1 ))
+      if (( mb > ${LARGE_FILE_REPO_MAXMB[$rkey]} )); then
+        LARGE_FILE_REPO_MAXMB[$rkey]=$mb
+      fi
     done < <(
       git -C "$mir" rev-list --objects --all 2>/dev/null \
         | git -C "$mir" cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' 2>/dev/null \
@@ -179,8 +203,16 @@ scan_large_files() {
     rm -rf "$mir"
   done < "$rows_tmp"
   rm -rf "$tmpdir"
+  echo "project_key,repo_slug,large_file_count,largest_file_mb" > "$LARGE_FILE_REPOS_CSV"
+  if (( LARGE_FILE_REPO_TOTAL > 0 )); then
+    local k
+    for k in "${!LARGE_FILE_REPO_SET[@]}"; do
+      printf '%s,%s,%s,%s\n' "${k%%/*}" "${k#*/}" "${LARGE_FILE_REPO_COUNT[$k]}" "${LARGE_FILE_REPO_MAXMB[$k]}" >> "$LARGE_FILE_REPOS_CSV"
+    done
+  fi
   if (( flagged > 0 )); then
-    log_warning "Large-file scan: ${flagged} file(s) >= ${threshold_mb}MB across ${scanned} repo(s). Use Git LFS for these before migrating. Report: ${LARGE_FILE_REPORT}"
+    log_warning "Large-file scan: ${flagged} file(s) >= ${threshold_mb}MB in ${LARGE_FILE_REPO_TOTAL} repo(s) across ${scanned} scanned. Use Git LFS for these before migrating. Report: ${LARGE_FILE_REPORT}"
+    log_warning "Repos with large files will be marked not-ready and skipped by migration. Skip-list: ${LARGE_FILE_REPOS_CSV}"
   else
     log_success "Large-file scan: no files >= ${threshold_mb}MB found across ${scanned} repo(s)."
   fi
@@ -213,10 +245,12 @@ rows_tmp="$(mktemp)"
 # Strip stray quotes then copy data rows into temp file
 sed 's/"//g' "$CSV_PATH" | tail -n +2 > "$rows_tmp"
 
+scan_large_files
+
 # Process
 ready_tmp="$(mktemp)"
 results_tmp="$(mktemp)"
-echo "project_key,project_name,repo_slug,is_archived,open_pr_count,warnings,ready_to_migrate" > "$results_tmp"
+echo "project_key,project_name,repo_slug,is_archived,open_pr_count,warnings,ready_to_migrate,has_large_files" > "$results_tmp"
 
 total_open_prs=0
 pr_check_failed=false
@@ -225,8 +259,8 @@ while IFS=',' read -r projKey projName repoSlug isArchived _rest; do
   if [[ "$openPrs" == "ERROR" || ! "$openPrs" =~ ^[0-9]+$ ]]; then
     pr_check_failed=true
     echo "[ERROR] ${projKey}/${repoSlug}: failed to query open PRs (API error)"
-    printf "%s,%s,%s,%s,%s,%s,%s\n" \
-      "$projKey" "$projName" "$repoSlug" "${isArchived:-false}" "ERROR" "API_FAILURE" "false" >> "$results_tmp"
+    printf "%s,%s,%s,%s,%s,%s,%s,%s\n" \
+      "$projKey" "$projName" "$repoSlug" "${isArchived:-false}" "ERROR" "API_FAILURE" "false" "false" >> "$results_tmp"
     continue
   fi
   total_open_prs=$(( total_open_prs + openPrs ))
@@ -236,11 +270,19 @@ while IFS=',' read -r projKey projName repoSlug isArchived _rest; do
     echo "[WARNING] ${projKey}/${repoSlug} PRs(Open): ${openPrs}"
   else
     echo "[OK] ${projKey}/${repoSlug} PRs(Open): ${openPrs}"
-    echo "${projKey}/${repoSlug}" >> "$ready_tmp"
+  fi
+  hasLarge=false
+  if [[ -n "${LARGE_FILE_REPO_SET["${projKey}/${repoSlug}"]:-}" ]]; then
+    hasLarge=true
+    warns="${warns:+${warns}|}LARGE_FILES"
+    echo "[WARNING] ${projKey}/${repoSlug} has ${LARGE_FILE_REPO_COUNT["${projKey}/${repoSlug}"]} file(s) >= ${LARGE_FILE_THRESHOLD_MB_EFFECTIVE}MB - excluded from migration (convert to Git LFS, or override with MIGRATE_LARGE_FILE_REPOS=true)"
   fi
   ready=false; [[ -z "$warns" ]] && ready=true
-  printf "%s,%s,%s,%s,%s,%s,%s\n" \
-    "$projKey" "$projName" "$repoSlug" "${isArchived:-false}" "$openPrs" "$warns" "$ready" >> "$results_tmp"
+  if [[ "$ready" == true ]]; then
+    echo "${projKey}/${repoSlug}" >> "$ready_tmp"
+  fi
+  printf "%s,%s,%s,%s,%s,%s,%s,%s\n" \
+    "$projKey" "$projName" "$repoSlug" "${isArchived:-false}" "$openPrs" "$warns" "$ready" "$hasLarge" >> "$results_tmp"
 done < "$rows_tmp"
 
 mv "$results_tmp" "$OUTPUT_CSV"
@@ -248,11 +290,22 @@ echo "[INFO] Wrote precheck CSV: $OUTPUT_CSV"
 
 if [[ -s "$ready_tmp" ]]; then
   echo ""
-  echo "[READY] Repos ready to migrate (no open PRs)✅:"
+  echo "[READY] Repos ready to migrate (no open PRs, no large files)✅:"
   sed 's/^/ - /' "$ready_tmp"
 else
   echo ""
-  echo "[READY] No repos are currently without open PRs."
+  echo "[READY] No repos are currently ready to migrate."
+fi
+
+if (( LARGE_FILE_REPO_TOTAL > 0 )); then
+  echo ""
+  echo "[DEFERRED] Repos with file(s) >= ${LARGE_FILE_THRESHOLD_MB_EFFECTIVE}MB - excluded from this migration:"
+  for rkey in "${!LARGE_FILE_REPO_SET[@]}"; do
+    echo " - ${rkey} (${LARGE_FILE_REPO_COUNT[$rkey]} file(s), largest ${LARGE_FILE_REPO_MAXMB[$rkey]} MB)"
+  done
+  echo "[DEFERRED] Skip-list CSV: ${LARGE_FILE_REPOS_CSV}"
+  echo "[DEFERRED] Per-file detail: ${LARGE_FILE_REPORT}"
+  echo "[DEFERRED] Convert these repos to Git LFS, then migrate them with MIGRATE_LARGE_FILE_REPOS=true."
 fi
 
 total_repos="$(($(wc -l < "$rows_tmp")))"
@@ -260,9 +313,8 @@ total_repos="$(($(wc -l < "$rows_tmp")))"
 echo ""
 echo "[SUMMARY] Total repos: $total_repos"
 echo "Open PRs total: $total_open_prs"
+echo "Repos with large files (deferred): $LARGE_FILE_REPO_TOTAL"
 echo "======================Completed============================="
-
-scan_large_files
 
 hasActiveItems=false
 (( total_open_prs > 0 )) && hasActiveItems=true
