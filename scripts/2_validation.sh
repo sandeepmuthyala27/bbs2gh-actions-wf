@@ -107,12 +107,15 @@ check_tls() {
 }
 check_tls
 
+urlencode_uri() { jq -rn --arg s "$1" '$s|@uri'; }
+
 # ---- Bitbucket helpers --------------------------------------------------------
 # Returns tab-separated lines: branchName<TAB>sha  (paginated, limit 500 per page)
 get_bbs_branches_with_shas() {
   local projectKey="$1" repoSlug="$2" start=0
+  local encProjectKey encRepoSlug; encProjectKey="$(urlencode_uri "$projectKey")"; encRepoSlug="$(urlencode_uri "$repoSlug")"
   while :; do
-    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${repoSlug}/branches?limit=500&start=${start}")"
+    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProjectKey}/repos/${encRepoSlug}/branches?limit=500&start=${start}")"
     echo "$resp" | jq -r '.values[]? | [.displayId, .latestCommit] | @tsv'
     local isLast; isLast="$(echo "$resp" | jq -r '.isLastPage')"
     local nextStart; nextStart="$(echo "$resp" | jq -r '.nextPageStart // empty')"
@@ -131,13 +134,13 @@ get_gh_branches_with_shas() {
   gh api "/repos/${org}/${repo}/branches" --paginate | jq -r '.[] | [.name, .commit.sha] | @tsv'
 }
 
-urlencode_uri() { jq -rn --arg s "$1" '$s|@uri'; }
-
 get_bbs_commit_count() {
   local projectKey="$1" repoSlug="$2" branch="$3"
-  local total=0 start=0 limit=1000 encBranch; encBranch="$(urlencode_uri "$branch")"
+  local total=0 start=0 limit=1000
+  local encProjectKey encRepoSlug encBranch
+  encProjectKey="$(urlencode_uri "$projectKey")"; encRepoSlug="$(urlencode_uri "$repoSlug")"; encBranch="$(urlencode_uri "$branch")"
   while :; do
-    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${projectKey}/repos/${repoSlug}/commits?until=${encBranch}&limit=${limit}&start=${start}")"
+    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProjectKey}/repos/${encRepoSlug}/commits?until=${encBranch}&limit=${limit}&start=${start}")"
     local cnt; cnt="$(echo "$resp" | jq '.values | length' 2>/dev/null || echo 0)"
     [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
     total=$(( total + cnt ))
@@ -304,7 +307,7 @@ validate_repo() {
     elif [[ "$ghExists" == "yes" && "${#bbsSHAmap[@]}" -gt 0 && "${#ghSHAmap[@]}" -gt 0 ]]; then
       local ghDefault bbsDefault validation_branch=""
       ghDefault="$(gh api "/repos/${ghOrg}/${ghRepo}" --jq '.default_branch' 2>/dev/null || true)"
-      bbsDefault="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${bbsProjectKey}/repos/${bbsRepoSlug}/branches/default" 2>/dev/null | jq -r '.displayId // empty' 2>/dev/null || true)"
+      bbsDefault="$(curl_json "${BASE_URL}/rest/api/1.0/projects/$(urlencode_uri "$bbsProjectKey")/repos/$(urlencode_uri "$bbsRepoSlug")/branches/default" 2>/dev/null | jq -r '.displayId // empty' 2>/dev/null || true)"
       if [[ -n "$ghDefault" && ( -n "${ghSHAmap[$ghDefault]:-}" || -n "${bbsSHAmap[$ghDefault]:-}" ) ]]; then
         validation_branch="$ghDefault"
       elif [[ -n "$bbsDefault" && ( -n "${ghSHAmap[$bbsDefault]:-}" || -n "${bbsSHAmap[$bbsDefault]:-}" ) ]]; then
