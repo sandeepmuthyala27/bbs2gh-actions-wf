@@ -4,21 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "GitHub Environment that holds the migration secrets & variables (and optional approval reviewers)."
+        description: "GitHub Environment holding secrets & variables for pre-check, validation and monitoring. No required reviewers."
         required: true
         default: 'bbs-migration'
         type: string
-      max_concurrent:
-        description: Maximum concurrent migrations (1-10)
-        required: false
-        default: '5'
-        type: choice
-        options: ['1','2','3','4','5','6','7','8','9','10']
-      target_api_url:
-        description: "GitHub data residency API base URL. (https://api.<tenant>.ghe.com)"
-        required: false
-        default: ''
+      approval_environment:
+        description: "GitHub Environment used only by the migration stage. Add required reviewers here to gate migration."
+        required: true
+        default: 'bbs-migration-approval'
         type: string
+      max_concurrent:
+        description: "Maximum concurrent migrations (1-10; the tool supports up to 10)"
+        required: false
+        default: '10'
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']
       verbose:
         description: Enable verbose logging (sets VERBOSE=1 and uploads *.log artifacts if produced)
         required: false
@@ -30,7 +30,7 @@ on:
         default: ubuntu-latest
         type: string
       run_pre_validation:
-        description: "Run Stage 1: pre-migration checks (open PRs + large-file report)"
+        description: "Run Stage 1: pre-migration checks (open PRs)"
         required: true
         default: 'true'
         type: choice
@@ -53,12 +53,11 @@ on:
         default: 'true'
         type: choice
         options: ['true', 'false']
-      migrate_large_file_repos:
-        description: "Migrate repos containing large files (>= LARGE_FILE_THRESHOLD_MB, default 400MB). 'false' skips them and reports them for a later Git LFS migration."
-        required: true
-        default: 'false'
-        type: choice
-        options: ['false', 'true']
+      lfs_scan_run_id:
+        description: "Optional run ID of a bbs2gh-gitlfs scan. When set, repos flagged with large files in that scan are skipped here and left to the Git LFS workflow. Leave empty to migrate every repo in repos.csv."
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -110,8 +109,7 @@ jobs:
           BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
           BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
           BITBUCKET_HOME: ${{ vars.BITBUCKET_HOME }}
-          RUN_LARGE_FILE_SCAN: ${{ vars.RUN_LARGE_FILE_SCAN }}
-          LARGE_FILE_THRESHOLD_MB: ${{ vars.LARGE_FILE_THRESHOLD_MB }}
+          RUN_LARGE_FILE_SCAN: 'false'
         run: |
           set -euo pipefail
           chmod +x scripts/*.sh || true
@@ -139,46 +137,18 @@ jobs:
             else
               total=$(awk -F',' 'NR>1 {c++} END{print c+0}' "$out_csv")
               ready=$(awk -F',' 'NR>1 && $7=="true" {c++} END{print c+0}' "$out_csv")
-              with_prs=$(( total - ready ))
               echo "- **Total repos checked**: $total"
               echo "- **Ready to migrate**: ✅ $ready"
-              echo "- **With open PRs**: $( [[ "$with_prs" -gt 0 ]] && echo \"⚠️ $with_prs\" || echo \"0\" )"
+              echo "- **With open PRs**: $open_pr_repos (informational — open PRs do not block migration)"
               echo
               echo "**Repo Details**"
               echo
-              echo "| Project Key | Repo | Open PRs | Large Files | Ready |"
-              echo "|-|-|-|-|-|"
+              echo "| Project Key | Repo | Open PRs | Ready |"
+              echo "|-|-|-|-|"
               awk -F',' 'NR>1 {
-                mark=($7=="true" ? "✅" : "⚠️");
-                lf=($8=="true" ? "⏭️ yes" : "no");
-                printf("| `%s` | `%s` | %s | %s | %s |\n", $1, $3, $5, lf, mark);
+                mark=($7=="true" ? "✅" : "⏭️ skipped");
+                printf("| `%s` | `%s` | %s | %s |\n", $1, $3, $5, mark);
               }' "$out_csv"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish large-file (>=400MB) report summary
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          lf_csv=$(ls -1t large_files_report-*.csv 2>/dev/null | head -n 1 || true)
-          {
-            echo "**🧬 Large-file report (Git LFS candidates)**"
-            echo
-            if [[ -z "$lf_csv" || ! -f "$lf_csv" ]]; then
-              echo "ℹ️ No large-file report produced (scan disabled or git unavailable)."
-            else
-              rows=$(awk -F',' 'NR>1 {c++} END{print c+0}' "$lf_csv")
-              thr="${LARGE_FILE_THRESHOLD_MB:-400}"
-              if [[ "$rows" -eq 0 ]]; then
-                echo "✅ No files ≥ ${thr}MB found."
-              else
-                echo "⚠️ Found **$rows** file(s) ≥ ${thr}MB. These repos are **excluded from migration** unless the workflow is re-run with \`migrate_large_file_repos = true\`. Convert them to Git LFS first."
-                echo
-                echo "| Project Key | Repo | File | Size (MB) |"
-                echo "|-|-|-|-|"
-                awk -F',' 'NR>1 { gsub(/"/,"",$3); printf("| `%s` | `%s` | `%s` | %s |\n", $1, $2, $3, $5) }' "$lf_csv"
-              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -189,8 +159,6 @@ jobs:
           name: bbs-prechecks-${{ github.run_id }}
           path: |
             bbs_pr_validation_output-*.csv
-            large_files_report-*.csv
-            large_file_repos-*.csv
           retention-days: 30
           if-no-files-found: warn
 
@@ -202,7 +170,7 @@ jobs:
     if: ${{ always()
       && inputs.run_migration == 'true'
       && (needs.prechecks.result == 'success' || (needs.prechecks.result == 'skipped' && inputs.run_pre_validation == 'false')) }}
-    environment: ${{ inputs.environment }}
+    environment: ${{ inputs.approval_environment }}
     env:
       GH_TOKEN: ${{ secrets.GH_PAT }}
       GH_PAT: ${{ secrets.GH_PAT }}
@@ -300,32 +268,34 @@ jobs:
           set -euo pipefail
           mkdir -p "${{ runner.temp }}/bbs2gh-run"
 
-      - name: Download prechecks output (large-file skip-list)
-        if: ${{ inputs.migrate_large_file_repos == 'false' }}
+      - name: Download large-file skip-list from Git LFS scan run
+        if: ${{ inputs.lfs_scan_run_id != '' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: bbs-prechecks-${{ github.run_id }}
+          name: bbs-lfs-scan-${{ inputs.lfs_scan_run_id }}
           path: ${{ runner.temp }}/bbs2gh-run
+          run-id: ${{ inputs.lfs_scan_run_id }}
+          github-token: ${{ secrets.GH_PAT }}
 
       - name: Resolve large-file skip-list
         shell: bash
         working-directory: ${{ runner.temp }}/bbs2gh-run
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.migrate_large_file_repos }}" == "true" ]]; then
-            echo "::warning::migrate_large_file_repos=true - repos with large files WILL be migrated. Ensure Git LFS is configured or these migrations may fail."
+          if [[ -z "${{ inputs.lfs_scan_run_id }}" ]]; then
+            echo "::notice::No lfs_scan_run_id supplied - every repo in repos.csv will be attempted. Run bbs2gh-gitlfs.yml first to identify and defer large-file repos."
             echo "LARGE_FILE_REPOS_CSV=" >> "$GITHUB_ENV"
             exit 0
           fi
           skip_csv=$(ls -1t large_file_repos-*.csv 2>/dev/null | head -n 1 || true)
           if [[ -z "$skip_csv" || ! -f "$skip_csv" ]]; then
-            echo "::notice::No large-file skip-list found (prechecks skipped, scan disabled, or no large files). All repos in the CSV will be attempted."
+            echo "::warning::lfs_scan_run_id=${{ inputs.lfs_scan_run_id }} was supplied but no skip-list artifact was found in that run. All repos will be attempted."
             echo "LARGE_FILE_REPOS_CSV=" >> "$GITHUB_ENV"
             exit 0
           fi
           count=$(awk -F',' 'NR>1 && NF>=2 {c++} END{print c+0}' "$skip_csv")
-          echo "::notice::Large-file skip-list: $count repo(s) will be skipped ($skip_csv)."
+          echo "::notice::Large-file skip-list: $count repo(s) will be skipped and left to bbs2gh-gitlfs.yml ($skip_csv)."
           echo "LARGE_FILE_REPOS_CSV=${{ runner.temp }}/bbs2gh-run/${skip_csv}" >> "$GITHUB_ENV"
 
       # Use a clean GH_CONFIG_DIR so `gh auth status` inside 1_migration.sh resolves correctly for Data Residency endpoints.
@@ -355,6 +325,7 @@ jobs:
           BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
           BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
           BITBUCKET_HOME: ${{ vars.BITBUCKET_HOME }}
+          BBS_SHARED_HOME: ${{ vars.BBS_SHARED_HOME }}
           SSH_USER: ${{ vars.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           TARGET_API_URL: ${{ env.TARGET_API_URL }}
@@ -363,7 +334,6 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_BUCKET_NAME: ${{ secrets.AWS_BUCKET_NAME }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
-          MIGRATE_LARGE_FILE_REPOS: ${{ inputs.migrate_large_file_repos }}
           LARGE_FILE_REPOS_CSV: ${{ env.LARGE_FILE_REPOS_CSV }}
         run: |
           set -euo pipefail
@@ -433,7 +403,7 @@ jobs:
                 echo
                 echo "**⏭️ Deferred for Git LFS migration**"
                 echo
-                echo "These repos contain files ≥ the large-file threshold and were skipped. Convert them to Git LFS, then re-run this workflow with **migrate_large_file_repos = true**."
+                echo "These repos were flagged by the Git LFS scan and skipped here. Migrate them with the **bbs2gh-gitlfs.yml** workflow."
                 echo
                 echo "| Project Key | BBS Repo | GitHub Org | GitHub Repo |"
                 echo "|-|-|-|-|"
@@ -509,6 +479,7 @@ jobs:
           mkdir -p "${{ runner.temp }}/bbs2gh-validate"
 
       - name: Download migration output CSV
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: migration-output-csv-${{ github.run_id }}
@@ -519,21 +490,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mig_csv=$(ls -1t "${{ runner.temp }}/bbs2gh-migrate-out"/repo_migration_output-*.csv 2>/dev/null | head -n 1 || true)
           filtered="${{ runner.temp }}/bbs2gh-validate/repos-validated.csv"
+          mapfile -t mig_csvs < <(ls -1 "${{ runner.temp }}/bbs2gh-migrate-out"/repo_migration_output-*.csv 2>/dev/null || true)
 
-          if [[ -z "$mig_csv" || ! -f "$mig_csv" ]]; then
+          if [[ "${#mig_csvs[@]}" -eq 0 ]]; then
             echo "::warning::No migration output CSV found — falling back to full repos.csv"
             cp "$GITHUB_WORKSPACE/repos.csv" "$filtered"
+            count=$(awk 'NR>1' "$filtered" | wc -l | tr -d ' ')
           else
             # Header from original repos.csv (project-key,project-name,repo,github_org,github_repo,gh_repo_visibility)
             head -n 1 "$GITHUB_WORKSPACE/repos.csv" > "$filtered"
-            # Keep rows where col 7 (Migration_Status) == Success
-            awk -F',' 'NR>1 { gsub(/"/, "", $7); if ($7=="Success") print $1","$2","$3","$4","$5","$6 }' "$mig_csv" >> "$filtered"
-            count=$(awk 'NR>1' "$filtered" | wc -l)
+            # Keep rows where col 7 (Migration_Status) == Success, across the standard and large-file runs
+            for c in "${mig_csvs[@]}"; do
+              echo "Reading migration output: $c"
+              awk -F',' 'NR>1 { gsub(/"/, "", $7); if ($7=="Success") print $1","$2","$3","$4","$5","$6 }' "$c"
+            done | sort -u >> "$filtered"
+            count=$(awk 'NR>1' "$filtered" | wc -l | tr -d ' ')
             echo "Repos to validate: $count"
-            echo "count=$count" >> "$GITHUB_OUTPUT"
           fi
+          echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "filtered_csv=$filtered" >> "$GITHUB_OUTPUT"
 
       - name: Skip validation if no repos succeeded
