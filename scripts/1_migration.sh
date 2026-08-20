@@ -10,6 +10,8 @@
 # Env (global settings):
 # BBS_BASE_URL
 # BBS_USERNAME / BBS_PASSWORD (Bitbucket admin/super admin)
+# BBS_SHARED_HOME (shared home path ON the Bitbucket Server host; defaults to
+#   $BITBUCKET_HOME/shared when BITBUCKET_HOME is set, else the gh bbs2gh default)
 # SSH_USER
 # SSH_PRIVATE_KEY_PATH or SSH_PRIVATE_KEY (raw PEM; should NOT be passphrase-protected)
 # GH_TOKEN/GH_PAT or gh auth login
@@ -38,7 +40,7 @@ VERBOSE="${VERBOSE:-0}"
 ############################################
 # CLI args
 ############################################
-MAX_CONCURRENT=10
+MAX_CONCURRENT=3
 CSV_PATH="repos.csv"
 OUTPUT_PATH="" # empty -> timestamped file
 
@@ -55,7 +57,7 @@ while [[ $# -gt 0 ]]; do
     --target-api-url|--github-api-url) TARGET_API_URL="$2"; shift 2;;
 
     -*|--*) echo -e "\033[31m[ERROR] Unknown option: $1\033[0m"; exit 1;;
-    *) echhttps://github.com/customer-success-microsoft/csu-ado-github-mf/pull/485/conflict?name=bbs-to-github%252Fprivate%252Fautomated-migration-dr-and-non-dr%252Fscripts%252F1_migration.sh&ancestor_oid=f1fb2ee399126573cd3a64235c1b4c7be1a371a6&base_oid=ea1da1860d1da77cda74deb68a4cab042679c23f&head_oid=b5cacb9c43a2819477410b9b6952997adebfb536o -e "\033[31m[ERROR] Unexpected positional arg: $1\033[0m"; exit 1;;
+    *) echo -e "\033[31m[ERROR] Unexpected positional arg: $1\033[0m"; exit 1;;
   esac
 done
 
@@ -141,6 +143,33 @@ detect_bbs_install() {
   return 0
 }
 detect_bbs_install || true
+
+BBS_SHARED_HOME_ARGS=()
+resolve_bbs_shared_home() {
+  local shared="${BBS_SHARED_HOME:-}"
+  if [[ -z "$shared" && -n "${BITBUCKET_HOME:-}" ]]; then
+    local home derived
+    home="${BITBUCKET_HOME%/}"
+    derived="$home"
+    [[ "$derived" == */shared ]] || derived="${derived}/shared"
+    if [[ -d "${derived}/data/migration/export" ]]; then
+      shared="$derived"
+    elif [[ -d "${home}/data/migration/export" ]]; then
+      shared="$home"
+      echo -e "\033[32m[OK] Export directory found directly under BITBUCKET_HOME; using it as the shared home.\033[0m"
+    else
+      shared="$derived"
+    fi
+  fi
+  if [[ -z "$shared" ]]; then
+    echo -e "\033[33m[WARNING] Neither BBS_SHARED_HOME nor BITBUCKET_HOME is set. gh bbs2gh will look for the export archive under its default shared home (/var/atlassian/application-data/bitbucket/shared). Set BBS_SHARED_HOME to the shared home path ON THE BITBUCKET SERVER HOST if your install differs.\033[0m"
+    return 0
+  fi
+  BBS_SHARED_HOME_ARGS=(--bbs-shared-home "$shared")
+  echo -e "\033[32m[OK] Bitbucket shared home passed to gh bbs2gh: ${shared}\033[0m"
+  return 0
+}
+resolve_bbs_shared_home
 
 # BBS env validation
 if [[ -z "${BBS_BASE_URL:-}" || -z "${BBS_USERNAME:-}" || -z "${BBS_PASSWORD:-}" ]]; then
@@ -395,6 +424,7 @@ migrate_repository() {
       --github-repo "${github_repo}" \
       "${STORAGE_ARGS[@]}" \
       ${BBS_TLS_ARGS[@]+"${BBS_TLS_ARGS[@]}"} \
+      ${BBS_SHARED_HOME_ARGS[@]+"${BBS_SHARED_HOME_ARGS[@]}"} \
       --ssh-user "${SSH_USER}" \
       --ssh-private-key "${resolvedKey}" \
       --target-api-url "${TARGET_API_URL}" \
@@ -475,6 +505,78 @@ load_large_file_skip_list() {
 load_large_file_skip_list
 
 ############################################
+# Repo slug resolution (gh bbs2gh --bbs-repo expects the slug, not the display name)
+############################################
+BBS_CURL_OPTS=(-sS)
+case "${BBS_DISABLE_SSL_VERIFY:-}" in
+  [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) BBS_CURL_OPTS+=(--insecure) ;;
+esac
+
+bbs_auth_header() {
+  if [[ -n "${BBS_PAT:-}" ]]; then
+    printf 'Authorization: Bearer %s' "$BBS_PAT"
+  else
+    printf 'Authorization: Basic %s' "$(printf '%s:%s' "${BBS_USERNAME}" "${BBS_PASSWORD}" | base64 | tr -d '\n')"
+  fi
+}
+
+bbs_urlencode() { jq -rn --arg v "$1" '$v|@uri'; }
+
+declare -A SLUG_CACHE=()
+
+resolve_repo_slug() {
+  local projectKey="$1" value="$2"
+  local key="${projectKey}/${value}"
+  if [[ -n "${SLUG_CACHE[$key]:-}" ]]; then
+    printf '%s' "${SLUG_CACHE[$key]}"
+    return 0
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '%s' "$value"
+    return 0
+  fi
+
+  local encP encV status
+  encP="$(bbs_urlencode "$projectKey")"
+  encV="$(bbs_urlencode "$value")"
+
+  status="$(curl "${BBS_CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' \
+    -H "$(bbs_auth_header)" \
+    "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos/${encV}" 2>/dev/null || echo 000)"
+  if [[ "$status" == "200" ]]; then
+    SLUG_CACHE[$key]="$value"
+    printf '%s' "$value"
+    return 0
+  fi
+
+  local start=0 resp found=""
+  while :; do
+    resp="$(curl "${BBS_CURL_OPTS[@]}" -H "$(bbs_auth_header)" \
+      "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos?limit=100&start=${start}" 2>/dev/null || true)"
+    [[ -z "$resp" ]] && break
+    found="$(printf '%s' "$resp" | jq -r --arg n "$value" '.values[]? | select((.name // "") == $n or ((.name // "") | ascii_downcase) == ($n | ascii_downcase)) | .slug' 2>/dev/null | head -n1 || true)"
+    [[ -n "$found" ]] && break
+    [[ "$(printf '%s' "$resp" | jq -r '.isLastPage' 2>/dev/null)" == "true" ]] && break
+    local nextStart; nextStart="$(printf '%s' "$resp" | jq -r '.nextPageStart // empty' 2>/dev/null)"
+    [[ -z "$nextStart" ]] && break
+    start="$nextStart"
+  done
+
+  if [[ -n "$found" ]]; then
+    echo -e "\033[33m[WARNING] '${value}' is a repository NAME, not a slug. Resolved to slug '${found}' for ${projectKey}.\033[0m" >&2
+    SLUG_CACHE[$key]="$found"
+    printf '%s' "$found"
+    return 0
+  fi
+
+  echo -e "\033[33m[WARNING] Could not resolve '${projectKey}/${value}' to a repository slug. Passing it through unchanged.\033[0m" >&2
+  SLUG_CACHE[$key]="$value"
+  printf '%s' "$value"
+  return 0
+}
+
+############################################
 # Load queue from CSV rows (skip header)
 ############################################
 LINE_NUM=0
@@ -504,6 +606,8 @@ while IFS= read -r line; do
     echo "Ensure project-key, repo, github_org, github_repo, gh_repo_visibility are populated."
     continue
   fi
+
+  repoSlug="$(resolve_repo_slug "${projectKey}" "${repoSlug}")"
 
   if [[ -n "${LARGE_FILE_SKIP["${projectKey}/${repoSlug}"]:-}" ]]; then
     echo "[WARNING] Skipping ${projectKey}/${repoSlug} -> ${github_org}/${github_repo}: contains large file(s) flagged by prechecks."
