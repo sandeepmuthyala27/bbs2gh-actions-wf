@@ -77,8 +77,14 @@ if [[ "${MAX_CONCURRENT}" -lt 1 ]]; then
   echo -e "\033[31m[ERROR] --max-concurrent must be at least 1.\033[0m"; exit 1
 fi
 
-# Normalize CRLF if present (Windows-generated CSV)
-sed -i 's/\r$//' "${CSV_PATH}" 2>/dev/null || true
+# Normalize CRLF if present (Windows-generated CSV) without rewriting the user's file
+if [[ -f "${CSV_PATH}" ]] && LC_ALL=C grep -q $'\r' "${CSV_PATH}" 2>/dev/null; then
+  CSV_NORMALIZED="$(mktemp)"
+  tr -d '\r' < "${CSV_PATH}" > "${CSV_NORMALIZED}"
+  trap 'rm -f "${CSV_NORMALIZED:-}"' EXIT
+  CSV_PATH="${CSV_NORMALIZED}"
+  echo -e "\033[33m[WARNING] CSV has Windows (CRLF) line endings; using a normalized temporary copy.\033[0m"
+fi
 
 if [[ ! -f "${CSV_PATH}" ]]; then
   echo -e "\033[31m[ERROR] CSV file not found: ${CSV_PATH}\033[0m"; exit 1
@@ -526,6 +532,10 @@ declare -A SLUG_CACHE=()
 
 resolve_repo_slug() {
   local projectKey="$1" value="$2"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  projectKey="${projectKey#"${projectKey%%[![:space:]]*}"}"
+  projectKey="${projectKey%"${projectKey##*[![:space:]]}"}"
   local key="${projectKey}/${value}"
   if [[ -n "${SLUG_CACHE[$key]:-}" ]]; then
     printf '%s' "${SLUG_CACHE[$key]}"
