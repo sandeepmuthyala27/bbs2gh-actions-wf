@@ -1,4 +1,4 @@
-​#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ------------------------------------------------------------------------------
 # BBS (Bitbucket Server/DC) -> GitHub parallel migration runner (CLI-friendly)
 # Accurate live status bar & counters:
@@ -475,6 +475,7 @@ QUEUE=()
 MIGRATED=()
 FAILED=()
 SKIPPED_LARGE=()
+NOT_FOUND=()
 
 ############################################
 # Large-file skip list (from prechecks)
@@ -541,6 +542,23 @@ bbs_urlencode() { jq -rn --arg v "$1" '$v|@uri'; }
 
 declare -A SLUG_CACHE=()
 
+list_project_repos() {
+  local projectKey="$1" encP start=0 resp out=""
+  encP="$(bbs_urlencode "$projectKey")"
+  while :; do
+    resp="$(curl "${BBS_CURL_OPTS[@]}" -H "$(bbs_auth_header)" "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos?limit=100&start=${start}" 2>/dev/null || true)"
+    [[ -z "$resp" ]] && break
+    out+="$(printf '%s' "$resp" | jq -r '.values[]?.slug' 2>/dev/null | tr '\n' ' ')"
+    [[ "$(printf '%s' "$resp" | jq -r '.isLastPage' 2>/dev/null)" == "true" ]] && break
+    local nextStart; nextStart="$(printf '%s' "$resp" | jq -r '.nextPageStart // empty' 2>/dev/null)"
+    [[ -z "$nextStart" ]] && break
+    start="$nextStart"
+  done
+  printf '%s' "${out:-<could not list>}"
+}
+
+WARN_SLUG() { echo -e "\033[33m[WARNING] $*\033[0m" >&2; }
+
 resolve_repo_slug() {
   local projectKey="$1" value="$2"
   value="${value#"${value%%[![:space:]]*}"}"
@@ -553,29 +571,34 @@ resolve_repo_slug() {
     return 0
   fi
 
-  if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-    echo -e "\033[31m[ERROR] curl and jq are required to resolve Bitbucket repository names to slugs.\033[0m" >&2
-    return 1
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '%s' "$value"
+    return 0
   fi
 
-  local encP encV status resp found=""
+  local encP encV status probe_body
+  probe_body="$(mktemp)"
   encP="$(bbs_urlencode "$projectKey")"
   encV="$(bbs_urlencode "$value")"
 
-  resp="$(curl "${BBS_CURL_OPTS[@]}" -w $'\n%{http_code}' \
+  status="$(curl "${BBS_CURL_OPTS[@]}" -o "$probe_body" -w '%{http_code}' \
     -H "$(bbs_auth_header)" \
-    "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos/${encV}" 2>/dev/null || true)"
-  status="${resp##*$'\n'}"
+    "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos/${encV}" 2>/dev/null || echo 000)"
   if [[ "$status" == "200" ]]; then
-    found="$(printf '%s' "${resp%$'\n'*}" | jq -r '.slug // empty' 2>/dev/null || true)"
-    if [[ -n "$found" ]]; then
-      SLUG_CACHE[$key]="$found"
-      printf '%s' "$found"
+    local realSlug; realSlug="$(jq -r '.slug // empty' < "$probe_body" 2>/dev/null || true)"
+    rm -f "$probe_body"
+    if [[ -n "$realSlug" ]]; then
+      if [[ "$realSlug" != "$value" ]]; then
+        WARN_SLUG "'${value}' is a repository NAME, not a slug. Resolved to slug '${realSlug}' for ${projectKey}."
+      fi
+      SLUG_CACHE[$key]="$realSlug"
+      printf '%s' "$realSlug"
       return 0
     fi
   fi
+  rm -f "$probe_body"
 
-  local start=0
+  local start=0 resp found=""
   while :; do
     resp="$(curl "${BBS_CURL_OPTS[@]}" -H "$(bbs_auth_header)" \
       "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos?limit=100&start=${start}" 2>/dev/null || true)"
@@ -588,6 +611,14 @@ resolve_repo_slug() {
     start="$nextStart"
   done
 
+  if [[ -z "$found" ]]; then
+    local resp2
+    resp2="$(curl "${BBS_CURL_OPTS[@]}" -H "$(bbs_auth_header)" "${BBS_BASE_URL}/rest/api/1.0/repos?projectkey=${encP}&name=${encV}&limit=100" 2>/dev/null || true)"
+    if [[ -n "$resp2" ]]; then
+      found="$(printf '%s' "$resp2" | jq -r --arg n "$value" --arg pk "$projectKey" '.values[]? | select((((.project.key // "")|ascii_downcase)==($pk|ascii_downcase)) and (((.name // "")|ascii_downcase)==($n|ascii_downcase))) | .slug' 2>/dev/null | head -n1 || true)"
+    fi
+  fi
+
   if [[ -n "$found" ]]; then
     echo -e "\033[33m[WARNING] '${value}' is a repository NAME, not a slug. Resolved to slug '${found}' for ${projectKey}.\033[0m" >&2
     SLUG_CACHE[$key]="$found"
@@ -595,10 +626,8 @@ resolve_repo_slug() {
     return 0
   fi
 
-  echo -e "\033[33m[WARNING] Could not resolve '${projectKey}/${value}' to a repository slug. Passing it through unchanged.\033[0m" >&2
-  SLUG_CACHE[$key]="$value"
   printf '%s' "$value"
-  return 0
+  return 1
 }
 
 ############################################
@@ -608,14 +637,17 @@ LINE_NUM=0
 while IFS= read -r line; do
   ((LINE_NUM++)) || true
   [[ ${LINE_NUM} -eq 1 ]] && continue
+  if [[ -z "${line//[[:space:]]/}" ]]; then
+    continue
+  fi
 
   mapfile -t F < <(parse_csv_line "${line}")
-  projectKey="${F[${COLIDX[project-key]}]}"
-  projectName="${F[${COLIDX[project-name]}]}"
-  repoSlug="${F[${COLIDX[repo]}]}"
-  github_org="${F[${COLIDX[github_org]}]}"
-  github_repo="${F[${COLIDX[github_repo]}]}"
-  gh_repo_visibility="${F[${COLIDX[gh_repo_visibility]}]}"
+  projectKey="${F[${COLIDX[project-key]}]:-}"
+  projectName="${F[${COLIDX[project-name]}]:-}"
+  repoSlug="${F[${COLIDX[repo]}]:-}"
+  github_org="${F[${COLIDX[github_org]}]:-}"
+  github_repo="${F[${COLIDX[github_repo]}]:-}"
+  gh_repo_visibility="${F[${COLIDX[gh_repo_visibility]}]:-}"
 
   # Trim quotes
   projectKey="$(strip_quotes "$projectKey")"
@@ -632,15 +664,20 @@ while IFS= read -r line; do
     continue
   fi
 
-  repoSlug="$(resolve_repo_slug "${projectKey}" "${repoSlug}")"
-
-  if [[ -n "${LARGE_FILE_SKIP["${projectKey}/${repoSlug}"]:-}" ]]; then
-    echo "[WARNING] Skipping ${projectKey}/${repoSlug} -> ${github_org}/${github_repo}: contains large file(s) flagged by prechecks."
-    SKIPPED_LARGE+=("${projectKey}"$'\t'"${projectName}"$'\t'"${repoSlug}"$'\t'"${github_org}"$'\t'"${github_repo}"$'\t'"${gh_repo_visibility}")
+  if ! repoSlug="$(resolve_repo_slug "${projectKey}" "${repoSlug}")"; then
+    echo -e "[31m[ERROR] No repository in ${projectKey} matches the name or slug '${repoSlug}'.[0m"
+    echo -e "[31m[ERROR] Available in ${projectKey}: $(list_project_repos "${projectKey}")[0m"
+    NOT_FOUND+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
     continue
   fi
 
-  QUEUE+=("${projectKey}"$'\t'"${projectName}"$'\t'"${repoSlug}"$'\t'"${github_org}"$'\t'"${github_repo}"$'\t'"${gh_repo_visibility}")
+  if [[ -n "${LARGE_FILE_SKIP["${projectKey}/${repoSlug}"]:-}" ]]; then
+    echo "[WARNING] Skipping ${projectKey}/${repoSlug} -> ${github_org}/${github_repo}: contains large file(s) flagged by prechecks."
+    SKIPPED_LARGE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
+    continue
+  fi
+
+  QUEUE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
 done < "${CSV_PATH}"
 
 ############################################
@@ -654,6 +691,10 @@ done
 for item in ${SKIPPED_LARGE[@]+"${SKIPPED_LARGE[@]}"}; do
   IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${item}"
   append_status_row "${projectKey}" "${projectName}" "${repoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}" "Skipped - Large Files" ""
+done
+for item in ${NOT_FOUND[@]+"${NOT_FOUND[@]}"}; do
+  IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${item}"
+  append_status_row "${projectKey}" "${projectName}" "${repoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}" "Failure - Repo Not Found" ""
 done
 
 echo "[INFO] Starting migration with ${MAX_CONCURRENT} concurrent jobs..."
@@ -760,7 +801,14 @@ done
 echo
 echo "[INFO] All migrations completed."
 total_repos=$(( $(wc -l < "${CSV_PATH}") - 1 ))
-echo "[SUMMARY] Total: ${total_repos} / Migrated: ${#MIGRATED[@]} / Failed: ${#FAILED[@]} / Skipped (large files): ${#SKIPPED_LARGE[@]}"
+echo "[SUMMARY] Total: ${total_repos} / Migrated: ${#MIGRATED[@]} / Failed: ${#FAILED[@]} / Skipped (large files): ${#SKIPPED_LARGE[@]} / Not found in Bitbucket: ${#NOT_FOUND[@]}"
+
+if (( ${#NOT_FOUND[@]} > 0 )); then
+  for item in "${NOT_FOUND[@]}"; do
+    IFS=$'\t' read -r pk _pn rs _go _gr _vis <<< "${item}"
+    echo "::error::repos.csv entry '${pk}/${rs}' matches no repository in Bitbucket - nothing was migrated for it."
+  done
+fi
 echo "[INFO] Wrote migration results with Migration_Status column: ${OUTPUT_CSV_PATH}"
 
 if (( ${#SKIPPED_LARGE[@]} > 0 )); then
