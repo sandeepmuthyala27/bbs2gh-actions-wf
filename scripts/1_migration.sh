@@ -177,6 +177,16 @@ resolve_bbs_shared_home() {
 }
 resolve_bbs_shared_home
 
+BBS_SSH_EXTRA_ARGS=()
+if [[ -n "${BBS_SSH_PORT:-}" ]]; then
+  BBS_SSH_EXTRA_ARGS+=(--ssh-port "${BBS_SSH_PORT}")
+  echo -e "\033[32m[OK] Using SSH port ${BBS_SSH_PORT} for archive download.\033[0m"
+fi
+if [[ -n "${BBS_ARCHIVE_DOWNLOAD_HOST:-}" ]]; then
+  BBS_SSH_EXTRA_ARGS+=(--archive-download-host "${BBS_ARCHIVE_DOWNLOAD_HOST}")
+  echo -e "\033[32m[OK] Downloading the export archive from host ${BBS_ARCHIVE_DOWNLOAD_HOST}.\033[0m"
+fi
+
 # BBS env validation
 if [[ -z "${BBS_BASE_URL:-}" || -z "${BBS_USERNAME:-}" || -z "${BBS_PASSWORD:-}" ]]; then
   echo -e "\033[31m[ERROR] BBS_BASE_URL, BBS_USERNAME, and BBS_PASSWORD must be set.\033[0m"
@@ -431,6 +441,7 @@ migrate_repository() {
       "${STORAGE_ARGS[@]}" \
       ${BBS_TLS_ARGS[@]+"${BBS_TLS_ARGS[@]}"} \
       ${BBS_SHARED_HOME_ARGS[@]+"${BBS_SHARED_HOME_ARGS[@]}"} \
+      ${BBS_SSH_EXTRA_ARGS[@]+"${BBS_SSH_EXTRA_ARGS[@]}"} \
       --ssh-user "${SSH_USER}" \
       --ssh-private-key "${resolvedKey}" \
       --target-api-url "${TARGET_API_URL}" \
