@@ -16,7 +16,7 @@ on:
       max_concurrent:
         description: "Maximum concurrent migrations (1-10; the tool supports up to 10)"
         required: false
-        default: '10'
+        default: '5'
         type: choice
         options: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']
       verbose:
@@ -74,7 +74,7 @@ jobs:
       open_pr_repos: ${{ steps.precheck-meta.outputs.open_pr_repos }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Resolve BBS_BASE_URL (repo/environment variable)
         shell: bash
@@ -152,9 +152,132 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Publish repository name -> slug map
+        if: always()
+        shell: bash
+        env:
+          BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
+          BBS_PAT: ${{ secrets.BBS_PAT }}
+          BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
+          BBS_USERNAME: ${{ vars.BBS_USERNAME }}
+          BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
+          BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
+        run: |
+          set -uo pipefail
+          BASE_URL="${BBS_BASE_URL%/}"
+
+          CURL_OPTS=(-sS)
+          case "${BBS_DISABLE_SSL_VERIFY:-}" in
+            [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) CURL_OPTS+=(--insecure) ;;
+          esac
+
+          if [[ -n "${BBS_PAT:-}" ]]; then
+            AUTH="Authorization: Bearer ${BBS_PAT}"
+            echo "Auth method: Bearer (BBS_PAT, ${#BBS_PAT} chars)"
+          elif [[ "${BBS_AUTH_TYPE:-}" == "Basic" && -n "${BBS_USERNAME:-}" && -n "${BBS_PASSWORD:-}" ]]; then
+            AUTH="Authorization: Basic $(printf '%s:%s' "$BBS_USERNAME" "$BBS_PASSWORD" | base64 | tr -d '\n')"
+            echo "Auth method: Basic (BBS_USERNAME=${BBS_USERNAME}, password ${#BBS_PASSWORD} chars)"
+          else
+            echo "::warning::No Bitbucket credentials available - skipping name/slug map."
+            exit 0
+          fi
+
+          csv="$GITHUB_WORKSPACE/repos.csv"
+          keys="$(awk -F',' 'NR>1 && NF>=3 {gsub(/\r/,""); gsub(/"/,"",$1); if ($1!="") print $1}' "$csv" 2>/dev/null | sort -u)"
+          [[ -z "$keys" ]] && { echo "::notice::No project keys found in repos.csv."; exit 0; }
+
+          {
+            echo "**🔎 Bitbucket repository name → slug**"
+            echo
+            echo "\`repos.csv\` may use either the name or the slug; the scripts resolve names to slugs automatically."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          allpairs="$(mktemp)"
+          for pk in $keys; do
+            encPk="$(jq -rn --arg v "$pk" '$v|@uri')"
+            start=0
+            pairs="$(mktemp)"
+            fetch_ok=true
+            while :; do
+              body="$(mktemp)"
+              status="$(curl "${CURL_OPTS[@]}" -o "$body" -w '%{http_code}' -H "$AUTH" "${BASE_URL}/rest/api/1.0/projects/${encPk}/repos?limit=100&start=${start}" 2>/dev/null || echo 000)"
+              if [[ "$status" != "200" ]]; then
+                echo "::error::Listing repositories for project '${pk}' failed (HTTP ${status}). $(head -c 300 "$body" 2>/dev/null)"
+                fetch_ok=false
+                rm -f "$body"
+                break
+              fi
+              jq -r '.values[]? | [.name, .slug] | @tsv' < "$body" >> "$pairs" 2>/dev/null
+              last="$(jq -r '.isLastPage' < "$body" 2>/dev/null)"
+              nextStart="$(jq -r '.nextPageStart // empty' < "$body" 2>/dev/null)"
+              rm -f "$body"
+              [[ "$last" == "true" ]] && break
+              [[ -z "$nextStart" ]] && break
+              start="$nextStart"
+            done
+            if [[ "$fetch_ok" != true || ! -s "$pairs" ]]; then
+              FETCH_FAILED=true
+            fi
+
+            {
+              echo "**Project \`${pk}\`**"
+              echo
+              if [[ ! -s "$pairs" ]]; then
+                echo "⚠️ No repositories returned (check the project key and credentials)."
+              else
+                echo "| Name | Slug |"
+                echo "|-|-|"
+                awk -F'\t' '{printf("| `%s` | `%s` |\n", $1, $2)}' "$pairs"
+              fi
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            awk -F'\t' -v pk="$pk" '{print pk"\t"$1"\t"$2}' "$pairs" >> "$allpairs"
+            echo "--- ${pk} ---"
+            awk -F'\t' '{printf("  %s  ->  %s\n", $1, $2)}' "$pairs"
+            rm -f "$pairs"
+          done
+
+          if [[ "${FETCH_FAILED:-false}" == true ]]; then
+            {
+              echo "**⚠️ Could not list repositories**"
+              echo
+              echo "The name → slug map above is incomplete, so \`repos.csv\` entries were NOT checked."
+              echo "Verify the Bitbucket credentials and that the account can read these projects."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Skipped the repos.csv match check because the repository listing could not be retrieved."
+            exit 0
+          fi
+
+          unmatched="$(mktemp)"
+          awk -F',' 'NR>1 && NF>=3 {gsub(/\r/,""); for(i=1;i<=NF;i++) gsub(/"/,"",$i); if ($1!="" && $3!="") print $1"\t"$3}' "$csv" 2>/dev/null \
+          | while IFS=$'\t' read -r pk repo; do
+              if ! awk -F'\t' -v pk="$pk" -v r="$repo" '
+                   $1==pk && (tolower($2)==tolower(r) || $3==r) {found=1} END{exit !found}' "$allpairs"; then
+                printf '%s\t%s\n' "$pk" "$repo" >> "$unmatched"
+              fi
+            done
+
+          if [[ -s "$unmatched" ]]; then
+            {
+              echo "**❌ repos.csv entries that match no repository**"
+              echo
+              echo "| Project Key | repos.csv value |"
+              echo "|-|-|"
+              awk -F'\t' '{printf("| `%s` | `%s` |\n", $1, $2)}' "$unmatched"
+              echo
+              echo "These will fail to migrate. Correct them to one of the names or slugs listed above."
+            } >> "$GITHUB_STEP_SUMMARY"
+            while IFS=$'\t' read -r pk repo; do
+              echo "::warning::repos.csv entry '${pk}/${repo}' matches no repository name or slug in Bitbucket."
+            done < "$unmatched"
+          fi
+          rm -f "$allpairs" "$unmatched"
+
       - name: Upload prechecks output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bbs-prechecks-${{ github.run_id }}
           path: |
@@ -162,8 +285,8 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-  migrate:
-    name: Migration
+  approval:
+    name: Approve migration
     runs-on: ${{ startsWith(inputs.runner_label, '[') && fromJson(inputs.runner_label) || inputs.runner_label }}
     timeout-minutes: 50400
     needs: [prechecks]
@@ -171,13 +294,28 @@ jobs:
       && inputs.run_migration == 'true'
       && (needs.prechecks.result == 'success' || (needs.prechecks.result == 'skipped' && inputs.run_pre_validation == 'false')) }}
     environment: ${{ inputs.approval_environment }}
+    steps:
+      - name: Approved
+        shell: bash
+        run: echo "Migration approved - proceeding."
+
+  migrate:
+    name: Migration
+    runs-on: ${{ startsWith(inputs.runner_label, '[') && fromJson(inputs.runner_label) || inputs.runner_label }}
+    timeout-minutes: 50400
+    needs: [prechecks, approval]
+    if: ${{ always()
+      && inputs.run_migration == 'true'
+      && needs.approval.result == 'success'
+      && (needs.prechecks.result == 'success' || (needs.prechecks.result == 'skipped' && inputs.run_pre_validation == 'false')) }}
+    environment: ${{ inputs.environment }}
     env:
       GH_TOKEN: ${{ secrets.GH_PAT }}
       GH_PAT: ${{ secrets.GH_PAT }}
       VERBOSE: ${{ inputs.verbose && '1' || '0' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Write migration start summary
         shell: bash
@@ -215,6 +353,18 @@ jobs:
           fi
           echo "BBS_BASE_URL=${BBS_BASE_URL}" >> "$GITHUB_ENV"
           echo "Resolved BBS_BASE_URL=${BBS_BASE_URL}"
+
+      - name: Check credentials are visible to this job
+        shell: bash
+        env:
+          GH_PAT_CHECK: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_PAT_CHECK}" ]]; then
+            echo "::error::GH_PAT is empty. Add it (and BBS_PAT/BBS_PASSWORD, SSH_PRIVATE_KEY) to the '${{ inputs.environment }}' environment, or at repo level."
+            exit 1
+          fi
+          echo "GH_PAT is present."
 
       - name: Verify GitHub CLI auth (non-interactive)
         shell: bash
@@ -271,7 +421,7 @@ jobs:
       - name: Download large-file skip-list from Git LFS scan run
         if: ${{ inputs.lfs_scan_run_id != '' }}
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: bbs-lfs-scan-${{ inputs.lfs_scan_run_id }}
           path: ${{ runner.temp }}/bbs2gh-run
@@ -326,6 +476,8 @@ jobs:
           BBS_DISABLE_SSL_VERIFY: ${{ vars.BBS_DISABLE_SSL_VERIFY }}
           BITBUCKET_HOME: ${{ vars.BITBUCKET_HOME }}
           BBS_SHARED_HOME: ${{ vars.BBS_SHARED_HOME }}
+          BBS_SSH_PORT: ${{ vars.BBS_SSH_PORT }}
+          BBS_ARCHIVE_DOWNLOAD_HOST: ${{ vars.BBS_ARCHIVE_DOWNLOAD_HOST }}
           SSH_USER: ${{ vars.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           TARGET_API_URL: ${{ env.TARGET_API_URL }}
@@ -347,7 +499,7 @@ jobs:
 
       - name: Upload migration logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: migration-logs-${{ github.run_id }}
           path: |
@@ -358,7 +510,7 @@ jobs:
 
       - name: Upload migration output CSV
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: migration-output-csv-${{ github.run_id }}
           path: ${{ runner.temp }}/bbs2gh-run/repo_migration_output-*.csv
@@ -430,7 +582,7 @@ jobs:
       GH_PAT: ${{ secrets.GH_PAT }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Write validation start summary
         shell: bash
@@ -480,7 +632,7 @@ jobs:
 
       - name: Download migration output CSV
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: migration-output-csv-${{ github.run_id }}
           path: ${{ runner.temp }}/bbs2gh-migrate-out
@@ -495,16 +647,16 @@ jobs:
 
           if [[ "${#mig_csvs[@]}" -eq 0 ]]; then
             echo "::warning::No migration output CSV found — falling back to full repos.csv"
-            cp "$GITHUB_WORKSPACE/repos.csv" "$filtered"
+            tr -d '\r' < "$GITHUB_WORKSPACE/repos.csv" | grep -v '^[[:space:]]*$' > "$filtered"
             count=$(awk 'NR>1' "$filtered" | wc -l | tr -d ' ')
           else
             # Header from original repos.csv (project-key,project-name,repo,github_org,github_repo,gh_repo_visibility)
-            head -n 1 "$GITHUB_WORKSPACE/repos.csv" > "$filtered"
+            head -n 1 "$GITHUB_WORKSPACE/repos.csv" | tr -d '\r' > "$filtered"
             # Keep rows where col 7 (Migration_Status) == Success, across the standard and large-file runs
             for c in "${mig_csvs[@]}"; do
               echo "Reading migration output: $c"
-              awk -F',' 'NR>1 { gsub(/"/, "", $7); if ($7=="Success") print $1","$2","$3","$4","$5","$6 }' "$c"
-            done | sort -u >> "$filtered"
+              tr -d '\r' < "$c" | awk -F',' 'NR>1 && NF>=6 { gsub(/"/, "", $7); if ($7=="Success") print $1","$2","$3","$4","$5","$6 }'
+            done | grep -v '^[[:space:]]*$' | sort -u >> "$filtered"
             count=$(awk 'NR>1' "$filtered" | wc -l | tr -d ' ')
             echo "Repos to validate: $count"
           fi
@@ -586,7 +738,7 @@ jobs:
 
       - name: Upload validation outputs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: validation-results-${{ github.run_id }}
           path: |
@@ -615,14 +767,14 @@ jobs:
           command -v python3 >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y python3; }
 
       - name: Download migration output CSV
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: migration-output-csv-${{ github.run_id }}
           path: mon-migrate
         continue-on-error: true
 
       - name: Download validation results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: validation-results-${{ github.run_id }}
           path: mon-validate
@@ -692,7 +844,7 @@ jobs:
 
       - name: Upload monitoring report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: monitoring-report-${{ github.run_id }}
           path: monitoring-report.md
