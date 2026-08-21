@@ -1,4 +1,2 @@
 project-key,project-name,repo,github_org,github_repo,gh_repo_visibility
-BBSMIG,bbs-migration-demo,Maven Hello World,bbs2gh-migration,MavenHelloWorld-21-aug,private
-BBSMIG,bbs-migration-demo,solid-api,bbs2gh-migration,solid-api-21-aug,private
-BBSMIG,bbs-migration-demo,solar system,bbs2gh-migration,solar-system-21-aug,private
+BBSMIG,bbs-migration-demo,solid-api,bbs2gh-migration,solid-api-22-aug,private
