@@ -553,25 +553,29 @@ resolve_repo_slug() {
     return 0
   fi
 
-  if ! command -v jq >/dev/null 2>&1; then
-    printf '%s' "$value"
-    return 0
+  if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    echo -e "\033[31m[ERROR] curl and jq are required to resolve Bitbucket repository names to slugs.\033[0m" >&2
+    return 1
   fi
 
-  local encP encV status
+  local encP encV status resp found=""
   encP="$(bbs_urlencode "$projectKey")"
   encV="$(bbs_urlencode "$value")"
 
-  status="$(curl "${BBS_CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' \
+  resp="$(curl "${BBS_CURL_OPTS[@]}" -w $'\n%{http_code}' \
     -H "$(bbs_auth_header)" \
-    "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos/${encV}" 2>/dev/null || echo 000)"
+    "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos/${encV}" 2>/dev/null || true)"
+  status="${resp##*$'\n'}"
   if [[ "$status" == "200" ]]; then
-    SLUG_CACHE[$key]="$value"
-    printf '%s' "$value"
-    return 0
+    found="$(printf '%s' "${resp%$'\n'*}" | jq -r '.slug // empty' 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+      SLUG_CACHE[$key]="$found"
+      printf '%s' "$found"
+      return 0
+    fi
   fi
 
-  local start=0 resp found=""
+  local start=0
   while :; do
     resp="$(curl "${BBS_CURL_OPTS[@]}" -H "$(bbs_auth_header)" \
       "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos?limit=100&start=${start}" 2>/dev/null || true)"
