@@ -1,3 +1,5 @@
 project-key,project-name,repo,github_org,github_repo,gh_repo_visibility
-BBSMIG,bbs-migration-demo,my.portfolio.react.app,bbs2gh-migration,my.portfolio.react.app-24,private
-BBSMIG,bbs-migration-demo,calotracker,bbs2gh-migration,calotracker24,private
+BBSMIG,bbs-migration-demo,Maven Hello World,bbs2gh-migration,MavenHelloWorld-28-aug,private
+BBSMIG,bbs-migration-demo,solar system,bbs2gh-migration,Solar-Sytem-28-aug,private
+BBSMIG,bbs-migration-demo,Test21,bbs2gh-migration,Test21-28-aug,private
+BBSMIG,bbs-migration-demo,voting_app,bbs2gh-migration,voting_app-28-aug,private
