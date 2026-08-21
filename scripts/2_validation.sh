@@ -89,8 +89,6 @@ $DISABLE_SSL_VERIFY && CURL_OPTS+=(--insecure)
 
 curl_json() { curl "${CURL_OPTS[@]}" -H "$(auth_header)" "$1"; }
 
-urlencode_uri() { jq -rn --arg s "$1" '$s|@uri'; }
-
 check_tls() {
   if $DISABLE_SSL_VERIFY; then
     log_warning "TLS certificate verification is DISABLED (BBS_DISABLE_SSL_VERIFY set). Proceeding without cert validation."
@@ -109,38 +107,84 @@ check_tls() {
 }
 check_tls
 
-# ---- Bitbucket helpers --------------------------------------------------------
-resolve_repo_slug() {
-  local projectKey="$1" repoValue="$2" start=0 resp found nextStart
-  local encProject; encProject="$(urlencode_uri "$projectKey")"
+urlencode_uri() { jq -rn --arg s "$1" '$s|@uri'; }
 
-  while :; do
-    resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProject}/repos?limit=100&start=${start}")"
-    found="$(printf '%s' "$resp" | jq -r --arg repo "$repoValue" \
-      '.values[]? | select(.slug == $repo or .name == $repo or ((.name // "") | ascii_downcase) == ($repo | ascii_downcase)) | .slug' \
-      | head -n 1)"
-    if [[ -n "$found" ]]; then
-      printf '%s' "$found"
+declare -A SLUG_CACHE=()
+
+WARN_SLUG() { log_warning "$*" >&2; }
+
+resolve_repo_slug() {
+  local projectKey="$1" value="$2"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  projectKey="${projectKey#"${projectKey%%[![:space:]]*}"}"
+  projectKey="${projectKey%"${projectKey##*[![:space:]]}"}"
+  local key="${projectKey}/${value}"
+  if [[ -n "${SLUG_CACHE[$key]:-}" ]]; then
+    printf '%s' "${SLUG_CACHE[$key]}"
+    return 0
+  fi
+
+  local encP encV status probe_body
+  probe_body="$(mktemp)"
+  encP="$(urlencode_uri "$projectKey")"
+  encV="$(urlencode_uri "$value")"
+
+  status="$(curl "${CURL_OPTS[@]}" -o "$probe_body" -w '%{http_code}' -H "$(auth_header)" \
+    "${BASE_URL}/rest/api/1.0/projects/${encP}/repos/${encV}" 2>/dev/null || echo 000)"
+  if [[ "$status" == "200" ]]; then
+    local realSlug; realSlug="$(jq -r '.slug // empty' < "$probe_body" 2>/dev/null || true)"
+    rm -f "$probe_body"
+    if [[ -n "$realSlug" ]]; then
+      if [[ "$realSlug" != "$value" ]]; then
+        WARN_SLUG "'${value}' is a repository NAME, not a slug. Resolved to slug '${realSlug}' for ${projectKey}."
+      fi
+      SLUG_CACHE[$key]="$realSlug"
+      printf '%s' "$realSlug"
       return 0
     fi
-    [[ "$(printf '%s' "$resp" | jq -r '.isLastPage // true')" == "true" ]] && break
-    nextStart="$(printf '%s' "$resp" | jq -r '.nextPageStart // empty')"
+  fi
+  rm -f "$probe_body"
+
+  local start=0 resp found=""
+  while :; do
+    resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encP}/repos?limit=100&start=${start}" 2>/dev/null || true)"
+    [[ -z "$resp" ]] && break
+    found="$(printf '%s' "$resp" | jq -r --arg n "$value" '.values[]? | select(((.name // "") | ascii_downcase) == ($n | ascii_downcase)) | .slug' 2>/dev/null | head -n1 || true)"
+    [[ -n "$found" ]] && break
+    [[ "$(printf '%s' "$resp" | jq -r '.isLastPage' 2>/dev/null)" == "true" ]] && break
+    local nextStart; nextStart="$(printf '%s' "$resp" | jq -r '.nextPageStart // empty' 2>/dev/null)"
     [[ -z "$nextStart" ]] && break
     start="$nextStart"
   done
 
-  log_error "Bitbucket repository '${projectKey}/${repoValue}' was not found by slug or display name."
-  return 1
+  if [[ -z "$found" ]]; then
+    local resp2
+    resp2="$(curl "${CURL_OPTS[@]}" -H "$(auth_header)" "${BASE_URL}/rest/api/1.0/repos?projectkey=${encP}&name=${encV}&limit=100" 2>/dev/null || true)"
+    if [[ -n "$resp2" ]]; then
+      found="$(printf '%s' "$resp2" | jq -r --arg n "$value" --arg pk "$projectKey" '.values[]? | select((((.project.key // "")|ascii_downcase)==($pk|ascii_downcase)) and (((.name // "")|ascii_downcase)==($n|ascii_downcase))) | .slug' 2>/dev/null | head -n1 || true)"
+    fi
+  fi
+
+  if [[ -n "$found" ]]; then
+    log_warning "'${value}' is a repository NAME, not a slug. Resolved to slug '${found}' for ${projectKey}." >&2
+    SLUG_CACHE[$key]="$found"
+    printf '%s' "$found"
+    return 0
+  fi
+
+  SLUG_CACHE[$key]="$value"
+  printf '%s' "$value"
+  return 0
 }
 
+# ---- Bitbucket helpers --------------------------------------------------------
 # Returns tab-separated lines: branchName<TAB>sha  (paginated, limit 500 per page)
 get_bbs_branches_with_shas() {
   local projectKey="$1" repoSlug="$2" start=0
-  local encProject encRepo
-  encProject="$(urlencode_uri "$projectKey")"
-  encRepo="$(urlencode_uri "$repoSlug")"
+  local encProjectKey encRepoSlug; encProjectKey="$(urlencode_uri "$projectKey")"; encRepoSlug="$(urlencode_uri "$repoSlug")"
   while :; do
-    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProject}/repos/${encRepo}/branches?limit=500&start=${start}")"
+    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProjectKey}/repos/${encRepoSlug}/branches?limit=500&start=${start}")"
     echo "$resp" | jq -r '.values[]? | [.displayId, .latestCommit] | @tsv'
     local isLast; isLast="$(echo "$resp" | jq -r '.isLastPage')"
     local nextStart; nextStart="$(echo "$resp" | jq -r '.nextPageStart // empty')"
@@ -161,12 +205,11 @@ get_gh_branches_with_shas() {
 
 get_bbs_commit_count() {
   local projectKey="$1" repoSlug="$2" branch="$3"
-  local total=0 start=0 limit=1000 encProject encRepo encBranch
-  encProject="$(urlencode_uri "$projectKey")"
-  encRepo="$(urlencode_uri "$repoSlug")"
-  encBranch="$(urlencode_uri "$branch")"
+  local total=0 start=0 limit=1000
+  local encProjectKey encRepoSlug encBranch
+  encProjectKey="$(urlencode_uri "$projectKey")"; encRepoSlug="$(urlencode_uri "$repoSlug")"; encBranch="$(urlencode_uri "$branch")"
   while :; do
-    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProject}/repos/${encRepo}/commits?until=${encBranch}&limit=${limit}&start=${start}")"
+    local resp; resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProjectKey}/repos/${encRepoSlug}/commits?until=${encBranch}&limit=${limit}&start=${start}")"
     local cnt; cnt="$(echo "$resp" | jq '.values | length' 2>/dev/null || echo 0)"
     [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
     total=$(( total + cnt ))
@@ -299,11 +342,7 @@ validate_repo() {
     fi
 
     # C — Branch count comparison
-    local bbsBranchCount ghBranchCount
-    set +u
-    bbsBranchCount="${#bbsSHAmap[@]}"
-    ghBranchCount="${#ghSHAmap[@]}"
-    set -u
+    local bbsBranchCount="${#bbsSHAmap[@]}" ghBranchCount="${#ghSHAmap[@]}"
     local branchCountOk="false"; [[ "$bbsBranchCount" -eq "$ghBranchCount" ]] && branchCountOk="true"
     if [[ "$branchCountOk" == "true" ]]; then
       echo "✅ Branch Count MATCHED | BBS=${bbsBranchCount} GitHub=${ghBranchCount}"
@@ -313,11 +352,11 @@ validate_repo() {
 
     local missingInGH missingInBBS
     missingInGH=$(comm -23 \
-      <(if (( bbsBranchCount > 0 )); then printf "%s\n" "${!bbsSHAmap[@]}"; fi | sort) \
-      <(if (( ghBranchCount > 0 )); then printf "%s\n" "${!ghSHAmap[@]}"; fi | sort) || true)
+      <(printf "%s\n" "${!bbsSHAmap[@]}" | sort) \
+      <(printf "%s\n" "${!ghSHAmap[@]}"  | sort) || true)
     missingInBBS=$(comm -13 \
-      <(if (( bbsBranchCount > 0 )); then printf "%s\n" "${!bbsSHAmap[@]}"; fi | sort) \
-      <(if (( ghBranchCount > 0 )); then printf "%s\n" "${!ghSHAmap[@]}"; fi | sort) || true)
+      <(printf "%s\n" "${!bbsSHAmap[@]}" | sort) \
+      <(printf "%s\n" "${!ghSHAmap[@]}"  | sort) || true)
     if [[ -n "$missingInGH" ]]; then
       echo "❌ Branches missing in GitHub: $(echo "$missingInGH" | tr '\n' ' ' | sed 's/ *$//')"
     else
@@ -337,10 +376,7 @@ validate_repo() {
     elif [[ "$ghExists" == "yes" && "${#bbsSHAmap[@]}" -gt 0 && "${#ghSHAmap[@]}" -gt 0 ]]; then
       local ghDefault bbsDefault validation_branch=""
       ghDefault="$(gh api "/repos/${ghOrg}/${ghRepo}" --jq '.default_branch' 2>/dev/null || true)"
-      local encProject encRepo
-      encProject="$(urlencode_uri "$bbsProjectKey")"
-      encRepo="$(urlencode_uri "$bbsRepoSlug")"
-      bbsDefault="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encProject}/repos/${encRepo}/branches/default" 2>/dev/null | jq -r '.displayId // empty' 2>/dev/null || true)"
+      bbsDefault="$(curl_json "${BASE_URL}/rest/api/1.0/projects/$(urlencode_uri "$bbsProjectKey")/repos/$(urlencode_uri "$bbsRepoSlug")/branches/default" 2>/dev/null | jq -r '.displayId // empty' 2>/dev/null || true)"
       if [[ -n "$ghDefault" && ( -n "${ghSHAmap[$ghDefault]:-}" || -n "${bbsSHAmap[$ghDefault]:-}" ) ]]; then
         validation_branch="$ghDefault"
       elif [[ -n "$bbsDefault" && ( -n "${ghSHAmap[$bbsDefault]:-}" || -n "${bbsSHAmap[$bbsDefault]:-}" ) ]]; then
@@ -411,18 +447,19 @@ validate_repo() {
 # Launch all repos in parallel
 declare -a PIDS=() OUTFILES=()
 while IFS= read -r line; do
+  if [[ -z "${line//[[:space:]]/}" ]]; then
+    continue
+  fi
   mapfile -t F < <(parse_csv_line "$line")
   bbsProjectKey="$(strip_quotes "${F[${COLIDX[project-key]}]:-}")"
-  bbsRepoValue="$(strip_quotes "${F[${COLIDX[repo]}]:-}")"
+  bbsRepoSlug="$(strip_quotes "${F[${COLIDX[repo]}]:-}")"
   ghOrg="$(strip_quotes "${F[${COLIDX[github_org]}]:-}")"
   ghRepo="$(strip_quotes "${F[${COLIDX[github_repo]}]:-}")"
-  if [[ -z "$bbsProjectKey" || -z "$bbsRepoValue" || -z "$ghOrg" || -z "$ghRepo" ]]; then
-    log_error "Skipping malformed CSV row with a missing required value: ${line}"
+  if [[ -z "$bbsProjectKey" || -z "$bbsRepoSlug" || -z "$ghOrg" || -z "$ghRepo" ]]; then
+    log_warning "Skipping malformed CSV row (${#F[@]} field(s)): ${line}"
     continue
   fi
-  if ! bbsRepoSlug="$(resolve_repo_slug "$bbsProjectKey" "$bbsRepoValue")"; then
-    continue
-  fi
+  bbsRepoSlug="$(resolve_repo_slug "$bbsProjectKey" "$bbsRepoSlug")"
   tmp_out="$(mktemp)"
   OUTFILES+=("$tmp_out")
   validate_repo "$bbsProjectKey" "$bbsRepoSlug" "$ghOrg" "$ghRepo" "$tmp_out" &
