@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+​#!/usr/bin/env bash
 # ------------------------------------------------------------------------------
 # BBS (Bitbucket Server/DC) -> GitHub parallel migration runner (CLI-friendly)
 # Accurate live status bar & counters:
@@ -632,11 +632,11 @@ while IFS= read -r line; do
 
   if [[ -n "${LARGE_FILE_SKIP["${projectKey}/${repoSlug}"]:-}" ]]; then
     echo "[WARNING] Skipping ${projectKey}/${repoSlug} -> ${github_org}/${github_repo}: contains large file(s) flagged by prechecks."
-    SKIPPED_LARGE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
+    SKIPPED_LARGE+=("${projectKey}"$'\t'"${projectName}"$'\t'"${repoSlug}"$'\t'"${github_org}"$'\t'"${github_repo}"$'\t'"${gh_repo_visibility}")
     continue
   fi
 
-  QUEUE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
+  QUEUE+=("${projectKey}"$'\t'"${projectName}"$'\t'"${repoSlug}"$'\t'"${github_org}"$'\t'"${github_repo}"$'\t'"${gh_repo_visibility}")
 done < "${CSV_PATH}"
 
 ############################################
