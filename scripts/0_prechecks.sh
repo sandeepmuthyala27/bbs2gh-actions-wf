@@ -134,6 +134,75 @@ ready_tmp=""
 results_tmp=""
 trap 'rm -f "${rows_tmp:-}" "${ready_tmp:-}" "${results_tmp:-}"' EXIT
 
+declare -A SLUG_CACHE=()
+
+WARN_SLUG() { log_warning "$*" >&2; }
+
+resolve_repo_slug() {
+  local projectKey="$1" value="$2"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  projectKey="${projectKey#"${projectKey%%[![:space:]]*}"}"
+  projectKey="${projectKey%"${projectKey##*[![:space:]]}"}"
+  local key="${projectKey}/${value}"
+  if [[ -n "${SLUG_CACHE[$key]:-}" ]]; then
+    printf '%s' "${SLUG_CACHE[$key]}"
+    return 0
+  fi
+
+  local encP encV status probe_body
+  probe_body="$(mktemp)"
+  encP="$(urlencode "$projectKey")"
+  encV="$(urlencode "$value")"
+
+  status="$(curl "${CURL_OPTS[@]}" -o "$probe_body" -w '%{http_code}' -H "$(auth_header)" \
+    "${BASE_URL}/rest/api/1.0/projects/${encP}/repos/${encV}" 2>/dev/null || echo 000)"
+  if [[ "$status" == "200" ]]; then
+    local realSlug; realSlug="$(jq -r '.slug // empty' < "$probe_body" 2>/dev/null || true)"
+    rm -f "$probe_body"
+    if [[ -n "$realSlug" ]]; then
+      if [[ "$realSlug" != "$value" ]]; then
+        WARN_SLUG "'${value}' is a repository NAME, not a slug. Resolved to slug '${realSlug}' for ${projectKey}."
+      fi
+      SLUG_CACHE[$key]="$realSlug"
+      printf '%s' "$realSlug"
+      return 0
+    fi
+  fi
+  rm -f "$probe_body"
+
+  local start=0 resp found=""
+  while :; do
+    resp="$(curl_json "${BASE_URL}/rest/api/1.0/projects/${encP}/repos?limit=100&start=${start}" 2>/dev/null || true)"
+    [[ -z "$resp" ]] && break
+    found="$(printf '%s' "$resp" | jq -r --arg n "$value" '.values[]? | select(((.name // "") | ascii_downcase) == ($n | ascii_downcase)) | .slug' 2>/dev/null | head -n1 || true)"
+    [[ -n "$found" ]] && break
+    [[ "$(printf '%s' "$resp" | jq -r '.isLastPage' 2>/dev/null)" == "true" ]] && break
+    local nextStart; nextStart="$(printf '%s' "$resp" | jq -r '.nextPageStart // empty' 2>/dev/null)"
+    [[ -z "$nextStart" ]] && break
+    start="$nextStart"
+  done
+
+  if [[ -z "$found" ]]; then
+    local resp2
+    resp2="$(curl "${CURL_OPTS[@]}" -H "$(auth_header)" "${BASE_URL}/rest/api/1.0/repos?projectkey=${encP}&name=${encV}&limit=100" 2>/dev/null || true)"
+    if [[ -n "$resp2" ]]; then
+      found="$(printf '%s' "$resp2" | jq -r --arg n "$value" --arg pk "$projectKey" '.values[]? | select((((.project.key // "")|ascii_downcase)==($pk|ascii_downcase)) and (((.name // "")|ascii_downcase)==($n|ascii_downcase))) | .slug' 2>/dev/null | head -n1 || true)"
+    fi
+  fi
+
+  if [[ -n "$found" ]]; then
+    log_warning "'${value}' is a repository NAME, not a slug. Resolved to slug '${found}' for ${projectKey}." >&2
+    SLUG_CACHE[$key]="$found"
+    printf '%s' "$found"
+    return 0
+  fi
+
+  SLUG_CACHE[$key]="$value"
+  printf '%s' "$value"
+  return 0
+}
+
 get_open_pr_count() {
   local projectKey="$1" repoSlug="$2"
   # Use limit=1 and read the top-level .size — a single call gives the full count
@@ -170,6 +239,7 @@ scan_large_files() {
   while IFS=',' read -r projKey projName repoSlug _rest; do
     [[ -z "${projKey:-}" || -z "${repoSlug:-}" ]] && continue
     scanned=$(( scanned + 1 ))
+    repoSlug="$(resolve_repo_slug "$projKey" "$repoSlug")"
     local mir="${tmpdir}/${projKey}_${repoSlug}.git"
     local encProjKey encRepoSlug; encProjKey="$(urlencode "$projKey")"; encRepoSlug="$(urlencode "$repoSlug")"
     if ! git "${git_ssl[@]}" -c http.extraHeader="$hdr" clone --mirror --quiet \
@@ -255,6 +325,10 @@ echo "project_key,project_name,repo_slug,is_archived,open_pr_count,warnings,read
 total_open_prs=0
 pr_check_failed=false
 while IFS=',' read -r projKey projName repoSlug isArchived _rest; do
+  if [[ -z "${projKey//[[:space:]]/}" || -z "${repoSlug//[[:space:]]/}" ]]; then
+    continue
+  fi
+  repoSlug="$(resolve_repo_slug "$projKey" "$repoSlug")"
   openPrs="$(get_open_pr_count "$projKey" "$repoSlug")"
   if [[ "$openPrs" == "ERROR" || ! "$openPrs" =~ ^[0-9]+$ ]]; then
     pr_check_failed=true
@@ -267,7 +341,7 @@ while IFS=',' read -r projKey projName repoSlug isArchived _rest; do
   warns=""
   if (( openPrs > 0 )); then
     warns="OPEN_PRS"
-    echo "[WARNING] ${projKey}/${repoSlug} PRs(Open): ${openPrs}"
+    echo "[INFO] ${projKey}/${repoSlug} PRs(Open): ${openPrs} - informational only, repo is still migrated"
   else
     echo "[OK] ${projKey}/${repoSlug} PRs(Open): ${openPrs}"
   fi
@@ -277,7 +351,10 @@ while IFS=',' read -r projKey projName repoSlug isArchived _rest; do
     warns="${warns:+${warns}|}LARGE_FILES"
     echo "[WARNING] ${projKey}/${repoSlug} has ${LARGE_FILE_REPO_COUNT["${projKey}/${repoSlug}"]} file(s) >= ${LARGE_FILE_THRESHOLD_MB_EFFECTIVE}MB - excluded from migration (convert to Git LFS, or override with MIGRATE_LARGE_FILE_REPOS=true)"
   fi
-  ready=false; [[ -z "$warns" ]] && ready=true
+  ready=true
+  if [[ "$hasLarge" == true ]]; then
+    ready=false
+  fi
   if [[ "$ready" == true ]]; then
     echo "${projKey}/${repoSlug}" >> "$ready_tmp"
   fi
@@ -290,7 +367,7 @@ echo "[INFO] Wrote precheck CSV: $OUTPUT_CSV"
 
 if [[ -s "$ready_tmp" ]]; then
   echo ""
-  echo "[READY] Repos ready to migrate (no open PRs, no large files)✅:"
+  echo "[READY] Repos ready to migrate (open PRs do not block; large-file repos excluded)✅:"
   sed 's/^/ - /' "$ready_tmp"
 else
   echo ""
@@ -312,20 +389,15 @@ total_repos="$(($(wc -l < "$rows_tmp")))"
 
 echo ""
 echo "[SUMMARY] Total repos: $total_repos"
-echo "Open PRs total: $total_open_prs"
+echo "Open PRs total: $total_open_prs (informational - does not block migration)"
 echo "Repos with large files (deferred): $LARGE_FILE_REPO_TOTAL"
 echo "======================Completed============================="
 
-hasActiveItems=false
-(( total_open_prs > 0 )) && hasActiveItems=true
-
-if [[ "$pr_check_failed" == true && "$hasActiveItems" == false ]]; then
-  echo -e "\n\033[31mValidation checks could not be completed due to API failures. Please review errors before proceeding.\033[0m\n"
+if [[ "$pr_check_failed" == true ]]; then
+  echo -e "\n\033[31mSome validation checks could not be completed due to API failures. Review the errors above before proceeding.\033[0m\n"
   exit 1
-elif [[ "$pr_check_failed" == true && "$hasActiveItems" == true ]]; then
-  echo -e "\n\033[33mOpen pull requests detected, but some validation checks failed. Review warnings and errors before proceeding.\033[0m\n"
-elif [[ "$pr_check_failed" == false && "$hasActiveItems" == true ]]; then
-  echo -e "\n\033[33mOpen pull requests found. Continue with migration if you have reviewed and are comfortable proceeding.\033[0m\n"
+elif (( LARGE_FILE_REPO_TOTAL > 0 )); then
+  echo -e "\n\033[33m${LARGE_FILE_REPO_TOTAL} repo(s) contain large files and will be skipped by migration. All other repos are ready to migrate.\033[0m\n"
 else
-  echo -e "\n\033[32mNo open pull requests detected. You can proceed with migration.\033[0m\n"
+  echo -e "\n\033[32mAll repos are ready to migrate.\033[0m\n"
 fi
